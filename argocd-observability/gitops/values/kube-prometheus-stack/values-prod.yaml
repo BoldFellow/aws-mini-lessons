@@ -1,0 +1,94 @@
+# Production overlay for kube-prometheus-stack.
+#
+# NOT loaded by the Application in apps/10-kube-prometheus-stack.yaml, which
+# loads values.yaml + values-dev.yaml. Point a SECOND Application at
+# values.yaml + this file to deploy a production instance.
+#
+# Everything here depends on a fact this repo cannot know: your hostname, your
+# identity provider, your certificate. That is exactly why it is not in the base
+# file — a plausible-looking placeholder that ships is worse than an absent one.
+
+grafana:
+  grafana.ini:
+    server:
+      # REQUIRED. Must be the URL users actually type. Grafana builds absolute
+      # redirects, alert links and rendered-image URLs from this; wrong value =
+      # login redirects to a host that does not resolve.
+      root_url: https://grafana.CHANGEME.example.com
+
+    security:
+      # Both of these REQUIRE that the URL above is really HTTPS. Enabling them
+      # on a plain-HTTP endpoint silently breaks the session cookie.
+      cookie_secure: true
+      strict_transport_security: true
+
+    analytics:
+      reporting_enabled: false
+      check_for_updates: false
+
+    # --- SSO -----------------------------------------------------------------
+    # Uncomment and fill in for your IdP. The client secret must NOT appear
+    # here: reference it from a Secret via the envs below instead.
+    # auth.generic_oauth:
+    #   enabled: true
+    #   name: CHANGEME-IdP
+    #   allow_sign_up: true
+    #   auto_login: false
+    #   client_id: CHANGEME
+    #   scopes: "openid email profile groups"
+    #   auth_url: https://idp.example.com/oauth2/authorize
+    #   token_url: https://idp.example.com/oauth2/token
+    #   api_url: https://idp.example.com/oauth2/userinfo
+    #   # Map IdP groups to Grafana roles. Without this everyone lands as the
+    #   # auto_assign_org_role from the base values (Viewer).
+    #   role_attribute_path: >-
+    #     contains(groups[*], 'platform-admins') && 'Admin'
+    #     || contains(groups[*], 'developers') && 'Editor'
+    #     || 'Viewer'
+    #   role_attribute_strict: true
+
+    auth.basic:
+      # Turn this off ONLY once SSO above is verified working. Until then the
+      # admin password is your only way in. Leaving both on permanently means
+      # the shared password stays a valid bypass of your IdP.
+      enabled: true
+
+  # Injects GF_AUTH_GENERIC_OAUTH_CLIENT_SECRET from a Secret, so the secret
+  # never enters this file or the rendered manifest.
+  # envFromSecret: grafana-oauth
+
+prometheus:
+  prometheusSpec:
+    retention: 30d
+    retentionSize: 180GB
+    externalLabels:
+      cluster: CHANGEME-prod
+    replicas: 2                 # survives a node drain
+    resources:
+      requests:
+        cpu: "2"
+        memory: 8Gi
+      limits:
+        memory: 12Gi
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: gp3
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 200Gi
+
+alertmanager:
+  alertmanagerSpec:
+    replicas: 3                 # gossip cluster; 3 is the smallest sane size
+  # Alerts go nowhere until this is set. Reference credentials from a Secret
+  # via `alertmanager.alertmanagerSpec.secrets`, never inline.
+  # config:
+  #   route:
+  #     receiver: platform-oncall
+  #     group_by: ['alertname', 'cluster', 'namespace']
+  #   receivers:
+  #     - name: platform-oncall
+  #       pagerduty_configs:
+  #         - service_key_file: /etc/alertmanager/secrets/pagerduty/key

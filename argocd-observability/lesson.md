@@ -313,8 +313,13 @@ kubectl -n observability create secret generic grafana-admin \
   --from-literal=admin-password="$(openssl rand -base64 24)"
 ```
 
-For real clusters, put it in AWS Secrets Manager and sync it in with the
-External Secrets Operator — then even the secret's existence is declarative.
+This command is the one genuinely non-reproducible step in the lesson, and it
+is deliberate: the *value* must not be in git, and a repo cannot know which
+secret store you use. For real clusters, put it in AWS Secrets Manager and pull
+it in with External Secrets Operator — see
+[`gitops/examples/external-secret-grafana-admin.yaml`](gitops/examples/external-secret-grafana-admin.yaml)
+for the manifest that replaces this command. ESO is not installed by this lesson
+because it is a chart plus its own IAM role, which is a lesson of its own.
 
 ## Step 5 — Commit and bootstrap
 
@@ -497,9 +502,9 @@ The honest gap list, roughly in the order I would close it:
 | Gap | Why it matters | Fix |
 |---|---|---|
 | **Alertmanager has no receivers** | Every alert fires into the default null route. You have monitoring that cannot page anyone. | `alertmanager.config` with a real receiver + `route`; store the webhook/SMTP creds in a Secret, not in values |
-| **Grafana `root_url` is a placeholder** | OAuth redirects, alert links and rendered images all break silently until it matches the real URL | Set it, together with the Ingress you actually terminate TLS on |
-| **No SSO** | `auth.basic` plus one shared admin password is the whole access model, and it is in a Secret anyone with namespace RBAC can read | Wire `auth.generic_oauth` to your IdP, then set `auth.basic.enabled: false` |
-| **Secrets are created by hand** | `grafana-admin` exists because someone ran a command once. It is not in git, but it is also not reproducible | External Secrets Operator sourcing AWS Secrets Manager |
+| **Grafana `root_url` unset** | Grafana builds absolute redirects and alert links from it; a wrong value sends users to a host that does not resolve. Left unset so the port-forward in Step 6 works | Set it in `values-prod.yaml` alongside the Ingress you terminate TLS on |
+| **No SSO** | `auth.basic` plus one shared admin password is the whole access model, and it is in a Secret anyone with namespace RBAC can read | `values-prod.yaml` has a filled-in `auth.generic_oauth` template; set `auth.basic.enabled: false` once it works |
+| **Secrets are created by hand** | `grafana-admin` exists because someone ran a command once — not in git, not reproducible, never rotated | `gitops/examples/external-secret-grafana-admin.yaml` |
 | **Loki is a single replica** | `singleBinary.replicas: 1` and `replication_factor: 1` — a node drain loses in-flight logs and stops ingestion | SimpleScalable or Distributed mode, replication_factor 3 |
 | **No TLS between components** | Alloy → Loki and Prometheus → targets are plain HTTP inside the cluster | A service mesh, or the charts' own TLS settings |
 | **Prometheus has no long-term storage** | 15 days on one EBS volume, gone if the PVC is | `remote_write` to Amazon Managed Prometheus or Thanos |

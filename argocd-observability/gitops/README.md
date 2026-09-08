@@ -14,8 +14,9 @@ argocd-observability/gitops/
 │   └── 30-alloy.yaml                      # sync-wave  2
 └── values/                            # Helm values, kept OUT of the app manifests
     ├── kube-prometheus-stack/
-    │   ├── values.yaml                # base
-    │   └── values-dev.yaml            # environment overlay
+    │   ├── values.yaml                # base — safe regardless of how it is reached
+    │   ├── values-dev.yaml            # loaded by the Application in apps/
+    │   └── values-prod.yaml           # NOT loaded; template for a prod Application
     ├── loki/
     │   └── values.yaml
     └── alloy/
@@ -77,6 +78,18 @@ resolves **relative to the chart root** — that is, the chart's own default
 values file, which Helm already loads. It does *not* pull `values.yaml` from
 your git repo. The Application syncs, reports Healthy, and applies pure
 upstream defaults. Use the `$values` form above instead.
+
+## What belongs in the base file vs. an overlay
+
+The split is not dev-vs-prod convenience, it is **whether the setting depends on
+a fact this repo cannot know**. `cookie_secure: true` is objectively more secure
+and still belongs in `values-prod.yaml`, because it silently breaks the session
+cookie unless Grafana is genuinely reached over HTTPS. A hardening setting
+applied to the wrong deployment shape is an outage, not a hardening.
+
+So: base carries what is true everywhere; the overlay carries hostnames, TLS
+assumptions, IdP endpoints and replica counts. A placeholder that looks
+plausible is worse than an absent value, because the plausible one ships.
 
 ## Credentials
 
