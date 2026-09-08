@@ -63,6 +63,24 @@ flowchart LR
 | EBS CSI driver add-on | for the Prometheus/Grafana/Loki PVCs |
 | `kubectl`, and `eksctl` ≥ 0.181 for Phase 2 | |
 | A fork of this repo | you will edit values files and push |
+| **2 worker nodes, ≥ 4 vCPU / 8 GiB total** | `t3.medium` × 2. See below — this is the one prerequisite people skip |
+
+### Sizing
+
+A full stack on an undersized cluster fails in confusing ways, so be concrete:
+
+- **Single-node clusters do not work.** Prometheus scheduling and resharding
+  fail, and Loki compaction gets unstable.
+- **`t3.small` is too small** — Prometheus gets OOM-killed during startup.
+- `t3.medium` × 2 (4 vCPU / 8 GiB total) reliably runs Prometheus,
+  Alertmanager, Grafana, Loki and Alloy together, with headroom for
+  compaction bursts and interactive Grafana use.
+
+Requests in these values total roughly 1.5 vCPU and 4 GiB, so that baseline is
+comfortable rather than tight. Real capacity planning depends on your log
+volume, retention and scrape frequency — this is a floor, not a sizing guide.
+
+*(Baseline validated by [LaurisNeimanis/gitops-observability-stack](https://github.com/LaurisNeimanis/gitops-observability-stack).)*
 
 ---
 
