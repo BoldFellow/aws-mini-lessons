@@ -10,7 +10,10 @@
 deploymentMode: Monolithic
 
 loki:
-  # Single tenant. Set true (and send X-Scope-OrgID) for real multi-tenancy.
+  # Single tenant. Loki has no built-in authentication either way: auth_enabled
+  # controls whether it REQUIRES an X-Scope-OrgID tenant header, not whether it
+  # verifies anyone. Real isolation comes from the NetworkPolicy below plus an
+  # authenticating proxy in front. Set true if more than one team shares this.
   auth_enabled: false
 
   commonConfig:
@@ -123,6 +126,27 @@ chunksCache:
   enabled: false
 resultsCache:
   enabled: false
+
+## ---------------------------------------------------------------------------
+## Network policy
+## ---------------------------------------------------------------------------
+# This matters BECAUSE auth_enabled is false. Loki's HTTP API is unauthenticated
+# and the gateway does not add auth, so without a NetworkPolicy any pod in the
+# cluster can push forged logs or read everyone's. Restrict ingress to the
+# observability namespace, which is where Alloy (push) and Grafana (query) live.
+networkPolicy:
+  enabled: true
+  ingress:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: observability
+  metrics:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: observability
+  externalStorage:
+    ports:
+      - 443          # egress to S3
 
 ## ---------------------------------------------------------------------------
 ## Self-monitoring

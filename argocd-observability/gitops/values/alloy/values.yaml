@@ -8,11 +8,14 @@ controller:
       operator: Exists
 
 alloy:
-  # /var/log and /var/lib/docker/containers must be mounted for file-based
-  # collection. Without varlog: true the pipeline silently collects nothing.
+  # /var/log must be mounted for file-based collection — without it the pipeline
+  # silently collects nothing. dockercontainers stays false: EKS nodes run
+  # containerd, so /var/lib/docker/containers does not exist, and the pod log
+  # path we read (/var/log/pods/...) is already covered by varlog. Every host
+  # mount you do not need is one an attacker cannot use.
   mounts:
     varlog: true
-    dockercontainers: true
+    dockercontainers: false
 
   # NODE_NAME is not set by the chart; the config below needs it to scope
   # discovery to this node only.

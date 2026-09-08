@@ -151,6 +151,34 @@ grafana:
   service:
     type: ClusterIP
 
+  # Grafana's defaults are tuned for a public demo, not a private cluster.
+  grafana.ini:
+    server:
+      # Must match the URL users actually reach Grafana on, or OAuth redirects
+      # and rendered image links break.
+      root_url: https://grafana.example.internal
+    security:
+      # Blocks Grafana being framed by another origin (clickjacking on the
+      # datasource proxy, which can reach Prometheus and Loki).
+      disable_gravatar: true
+      cookie_secure: true
+      cookie_samesite: strict
+      content_security_policy: true
+      strict_transport_security: true
+    users:
+      allow_sign_up: false
+      # New users get no org access until an admin grants it.
+      auto_assign_org_role: Viewer
+    auth.anonymous:
+      enabled: false
+    auth.basic:
+      # Turn off once SSO is wired up; leaving both on means the admin password
+      # remains a valid bypass of your identity provider.
+      enabled: true
+    analytics:
+      reporting_enabled: false
+      check_for_updates: false
+
   resources:
     requests:
       cpu: 100m

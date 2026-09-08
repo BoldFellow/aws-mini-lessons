@@ -44,6 +44,7 @@ spec:
     syncOptions:
       - CreateNamespace=true
       - ServerSideApply=true
+      - RespectIgnoreDifferences=true
       - PrunePropagationPolicy=foreground
       - PruneLast=true
     retry:
@@ -54,11 +55,15 @@ spec:
         maxDuration: 5m
 
   ignoreDifferences:
-    # StatefulSet PVC templates are immutable; Argo CD reports a permanent diff
-    # if the storage class defaults get filled in by the cluster.
+    # The API server stamps these onto each volumeClaimTemplate. Ignore only
+    # those fields — ignoring the whole block would also hide a real storage
+    # size change, so drift in `resources.requests.storage` would go unnoticed.
     - group: apps
       kind: StatefulSet
-      jsonPointers:
-        - /spec/volumeClaimTemplates
+      jqPathExpressions:
+        - .spec.volumeClaimTemplates[]?.apiVersion
+        - .spec.volumeClaimTemplates[]?.kind
+        - .spec.volumeClaimTemplates[]?.metadata.creationTimestamp
+        - .spec.volumeClaimTemplates[]?.status
 
   revisionHistoryLimit: 10

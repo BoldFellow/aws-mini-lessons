@@ -37,6 +37,16 @@ spec:
     namespace: observability
 
   syncPolicy:
+    # This app owns the namespace's labels. node-exporter needs hostNetwork and
+    # hostPID, so this namespace cannot be Pod Security 'restricted' or even
+    # 'baseline' — say so explicitly rather than leaving it unlabelled and
+    # inheriting whatever the cluster default becomes. Audit/warn stay at
+    # baseline so anything ELSE that goes privileged here still shows up.
+    managedNamespaceMetadata:
+      labels:
+        pod-security.kubernetes.io/enforce: privileged
+        pod-security.kubernetes.io/audit: baseline
+        pod-security.kubernetes.io/warn: baseline
     automated:
       prune: true
       selfHeal: true
@@ -66,11 +76,5 @@ spec:
       name: kube-prometheus-stack-admission
       jqPathExpressions:
         - .webhooks[]?.clientConfig.caBundle
-    # Grafana's dashboard sidecar rewrites this at runtime.
-    - group: apps
-      kind: Deployment
-      name: kube-prometheus-stack-grafana
-      jqPathExpressions:
-        - .spec.template.spec.containers[]?.resources
 
   revisionHistoryLimit: 10

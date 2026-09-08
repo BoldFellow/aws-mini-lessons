@@ -135,8 +135,43 @@ for b in chunks ruler; do
   aws s3api put-bucket-encryption --bucket "${BUCKET_PREFIX}-${b}" \
     --server-side-encryption-configuration \
     '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
+
+  # Reject any request that did not arrive over TLS. Encryption at rest above
+  # says nothing about the wire; without this, a plain-HTTP PutObject succeeds.
+  aws s3api put-bucket-policy --bucket "${BUCKET_PREFIX}-${b}" --policy "$(cat <<POLICY
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Sid": "DenyInsecureTransport",
+    "Effect": "Deny",
+    "Principal": "*",
+    "Action": "s3:*",
+    "Resource": [
+      "arn:aws:s3:::${BUCKET_PREFIX}-${b}",
+      "arn:aws:s3:::${BUCKET_PREFIX}-${b}/*"
+    ],
+    "Condition": { "Bool": { "aws:SecureTransport": "false" } }
+  }]
+}
+POLICY
+)"
+
+  # Loki uploads chunks as multipart. An ingester killed mid-upload leaves parts
+  # that are invisible to `s3 ls`, never expire, and are billed forever.
+  aws s3api put-bucket-lifecycle-configuration --bucket "${BUCKET_PREFIX}-${b}" \
+    --lifecycle-configuration '{"Rules":[{
+      "ID":"abort-incomplete-multipart",
+      "Status":"Enabled",
+      "Filter":{},
+      "AbortIncompleteMultipartUpload":{"DaysAfterInitiation":7}
+    }]}'
 done
 ```
+
+> Retention is enforced by Loki's compactor, not by an S3 lifecycle rule on
+> object age. Do not add one: it would delete chunks the index still references,
+> and queries would fail rather than return less. The only lifecycle rule that
+> is safe here is the multipart cleanup above.
 
 Create the IAM policy (least privilege — only these two buckets):
 
@@ -146,13 +181,26 @@ cat > /tmp/loki-s3-policy.json <<EOF
   "Version": "2012-10-17",
   "Statement": [
     {
-      "Sid": "LokiBucketAccess",
+      "Sid": "ListTheTwoBuckets",
       "Effect": "Allow",
-      "Action": ["s3:ListBucket", "s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+      "Action": ["s3:ListBucket", "s3:ListBucketMultipartUploads"],
       "Resource": [
         "arn:aws:s3:::${BUCKET_PREFIX}-chunks",
+        "arn:aws:s3:::${BUCKET_PREFIX}-ruler"
+      ]
+    },
+    {
+      "Sid": "ObjectsInThoseBuckets",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:DeleteObject",
+        "s3:AbortMultipartUpload",
+        "s3:ListMultipartUploadParts"
+      ],
+      "Resource": [
         "arn:aws:s3:::${BUCKET_PREFIX}-chunks/*",
-        "arn:aws:s3:::${BUCKET_PREFIX}-ruler",
         "arn:aws:s3:::${BUCKET_PREFIX}-ruler/*"
       ]
     }
@@ -440,6 +488,26 @@ The OSS Loki Helm chart moved from `grafana/helm-charts` to
 `grafana-community/helm-charts` (forked at 6.55.0, versioned independently from
 there). The chart still published at `grafana.github.io/helm-charts` is now
 maintained for Grafana Enterprise Logs. This lesson uses the community chart.
+
+## What this is NOT yet, before you run it in production
+
+Everything above is production-shaped, but a lab is not a production install.
+The honest gap list, roughly in the order I would close it:
+
+| Gap | Why it matters | Fix |
+|---|---|---|
+| **Alertmanager has no receivers** | Every alert fires into the default null route. You have monitoring that cannot page anyone. | `alertmanager.config` with a real receiver + `route`; store the webhook/SMTP creds in a Secret, not in values |
+| **Grafana `root_url` is a placeholder** | OAuth redirects, alert links and rendered images all break silently until it matches the real URL | Set it, together with the Ingress you actually terminate TLS on |
+| **No SSO** | `auth.basic` plus one shared admin password is the whole access model, and it is in a Secret anyone with namespace RBAC can read | Wire `auth.generic_oauth` to your IdP, then set `auth.basic.enabled: false` |
+| **Secrets are created by hand** | `grafana-admin` exists because someone ran a command once. It is not in git, but it is also not reproducible | External Secrets Operator sourcing AWS Secrets Manager |
+| **Loki is a single replica** | `singleBinary.replicas: 1` and `replication_factor: 1` — a node drain loses in-flight logs and stops ingestion | SimpleScalable or Distributed mode, replication_factor 3 |
+| **No TLS between components** | Alloy → Loki and Prometheus → targets are plain HTTP inside the cluster | A service mesh, or the charts' own TLS settings |
+| **Prometheus has no long-term storage** | 15 days on one EBS volume, gone if the PVC is | `remote_write` to Amazon Managed Prometheus or Thanos |
+| **`prune: true` everywhere** | A bad merge that deletes a file deletes the workload | Branch protection on the values path, and consider `prune: false` on stateful apps |
+
+The NetworkPolicy, Pod Identity, PSA labels, TLS-only buckets, scoped IAM and
+host-mount minimisation are already in place — those were worth doing up front
+because retrofitting them means downtime.
 
 ## Versions pinned in this lesson
 
