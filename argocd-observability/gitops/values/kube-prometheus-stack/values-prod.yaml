@@ -57,8 +57,128 @@ grafana:
   # never enters this file or the rendered manifest.
   # envFromSecret: grafana-oauth
 
+  replicas: 2
+
+  # Real access, instead of kubectl port-forward. Assumes AWS Load Balancer
+  # Controller and an ACM certificate; adjust for your ingress controller.
+  # The host here MUST match grafana.ini server.root_url above.
+  ingress:
+    enabled: true
+    ingressClassName: alb
+    annotations:
+      alb.ingress.kubernetes.io/scheme: internal        # not internet-facing
+      alb.ingress.kubernetes.io/target-type: ip
+      alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443}]'
+      alb.ingress.kubernetes.io/ssl-redirect: '443'
+      alb.ingress.kubernetes.io/certificate-arn: arn:aws:acm:eu-central-1:CHANGEME:certificate/CHANGEME
+    hosts:
+      - grafana.CHANGEME.example.com
+    tls:
+      - hosts: [grafana.CHANGEME.example.com]
+
+# A PriorityClass the stack's own pods use. The built-in
+# system-cluster-critical cannot be used outside kube-system — the PodPriority
+# admission controller rejects it — so define our own just below the built-ins.
+# Without this, monitoring is among the first things evicted under node
+# pressure, which is exactly when you need it.
+extraManifests:
+  - apiVersion: scheduling.k8s.io/v1
+    kind: PriorityClass
+    metadata:
+      name: observability-critical
+    value: 1000000000
+    globalDefault: false
+    preemptionPolicy: PreemptLowerPriority
+    description: "Observability stack. Evict application workloads first."
+
+# kube-prometheus-stack alerts on Kubernetes. Nothing in it alerts on the
+# LOGGING pipeline, so a silent Loki or a stalled Alloy looks like "quiet
+# logs" rather than an outage. These close that gap.
+additionalPrometheusRulesMap:
+  observability-self:
+    groups:
+      - name: observability.pipeline
+        rules:
+          - alert: LokiDown
+            expr: sum(up{job=~".*loki.*"}) == 0
+            for: 10m
+            labels: {severity: critical}
+            annotations:
+              summary: "Loki is not reachable — no logs are being stored"
+
+          - alert: LokiRequestErrors
+            expr: |
+              100 * sum by (route) (rate(loki_request_duration_seconds_count{status_code=~"5.."}[5m]))
+                  / sum by (route) (rate(loki_request_duration_seconds_count[5m])) > 5
+            for: 15m
+            labels: {severity: warning}
+            annotations:
+              summary: "Loki {{ $labels.route }} is returning >5% 5xx"
+
+          - alert: AlloyDroppingLogs
+            expr: sum(rate(loki_write_dropped_bytes_total[5m])) > 0
+            for: 10m
+            labels: {severity: critical}
+            annotations:
+              summary: "Alloy is dropping log bytes — ingest is failing, logs are lost"
+
+          - alert: AlloyNotRunningOnEveryNode
+            # A node with no collector produces no logs, silently.
+            expr: |
+              kube_daemonset_status_desired_number_scheduled{daemonset="alloy"}
+                - kube_daemonset_status_number_ready{daemonset="alloy"} > 0
+            for: 15m
+            labels: {severity: warning}
+            annotations:
+              summary: "Alloy is not ready on every node — those nodes ship no logs"
+
+          - alert: PrometheusRemoteWriteBehind
+            expr: |
+              (prometheus_remote_storage_highest_timestamp_in_seconds
+                - ignoring(remote_name, url) group_right
+                  prometheus_remote_storage_queue_highest_sent_timestamp_seconds) > 300
+            for: 15m
+            labels: {severity: warning}
+            annotations:
+              summary: "Remote write is >5m behind — long-term metrics are lagging"
+
 prometheus:
+  # A node drain can otherwise take every replica at once.
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+    unhealthyPodEvictionPolicy: AlwaysAllow
+
   prometheusSpec:
+    priorityClassName: observability-critical
+
+    # Spread replicas across AZs. ScheduleAnyway, not DoNotSchedule: a
+    # single-AZ cluster should still schedule rather than hang Pending.
+    topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: topology.kubernetes.io/zone
+        whenUnsatisfiable: ScheduleAnyway
+        labelSelector:
+          matchLabels:
+            app.kubernetes.io/name: prometheus
+
+    # Local retention is a cache; the durable copy lives in Amazon Managed
+    # Prometheus. 30d local keeps dashboards fast without querying remote.
+    remoteWrite:
+      - url: https://aps-workspaces.eu-central-1.amazonaws.com/workspaces/CHANGEME-WORKSPACE-ID/api/v1/remote_write
+        sigv4:
+          region: eu-central-1        # credentials via Pod Identity
+        queueConfig:
+          capacity: 10000
+          maxSamplesPerSend: 2000
+          maxShards: 200
+        writeRelabelConfigs:
+          # Do not pay to ship every series. Keep what dashboards and alerts
+          # actually read; drop the long tail.
+          - sourceLabels: [__name__]
+            regex: 'go_.*|process_.*|promhttp_.*'
+            action: drop
+
     retention: 30d
     retentionSize: 180GB
     externalLabels:
@@ -80,8 +200,13 @@ prometheus:
               storage: 200Gi
 
 alertmanager:
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 2             # gossip needs a quorum to dedupe correctly
+
   alertmanagerSpec:
     replicas: 3                 # gossip cluster; 3 is the smallest sane size
+    priorityClassName: observability-critical
     # Mounts secret/alertmanager-receivers at /etc/alertmanager/secrets/... so
     # the routing key below is read from a file, never written into git.
     #   kubectl -n observability create secret generic alertmanager-receivers \

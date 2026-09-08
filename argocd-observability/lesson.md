@@ -574,32 +574,67 @@ The OSS Loki Helm chart moved from `grafana/helm-charts` to
 there). The chart still published at `grafana.github.io/helm-charts` is now
 maintained for Grafana Enterprise Logs. This lesson uses the community chart.
 
-## Before this is production
+## Going to production
 
-This is a working lab install, not a production one. The gaps that matter most:
+`values-prod.yaml` next to each base file is the production configuration. It is
+loaded by nothing — point a second Application at `values.yaml` +
+`values-prod.yaml` per component to deploy it. What it changes, and why:
 
-- **Alertmanager receivers.** `values-prod.yaml` carries a full routing tree
-  (severity split, Watchdog to a deadman's switch, inhibit rules, keys read
-  from a mounted Secret). The dev overlay does not — so in the POC, alerts
-  still route to null. Wire a real receiver before trusting any of this.
-- **Loki is a single replica** with `replication_factor: 1`. A node drain stops
-  ingestion. `values-prod.yaml` moves to 3 replicas on S3; more than one replica
-  requires object storage.
-- **No SSO and no Ingress** — one shared admin password, reached by
-  port-forward. `values-prod.yaml` has a filled-in `auth.generic_oauth` block
-  with group-to-role mapping; it needs your IdP's endpoints. `root_url` and
-  `cookie_secure` are in there too and both require real HTTPS — setting them
-  without it breaks the session cookie.
-- **Loki has no auth.** `auth_enabled` only controls whether Loki *requires* a
-  tenant header, not whether it verifies anyone. A NetworkPolicy restricting
-  ingress to the `observability` namespace is enabled, which is the boundary —
-  put an authenticating proxy in front if other teams share the cluster.
-- **Prometheus keeps 15 days on one EBS volume.** For longer, `remote_write` to
-  Amazon Managed Prometheus.
+**Availability**
 
-Already handled, because retrofitting them means downtime: Pod Identity instead
-of static keys, scoped IAM, TLS-only buckets, Pod Security labels, and the
-compactor actually enforcing retention.
+| Setting | Without it |
+|---|---|
+| PodDisruptionBudgets on Prometheus, Alertmanager, operator, Loki | one `kubectl drain` takes every replica at once |
+| `priorityClassName: observability-critical` | monitoring is evicted first under node pressure — exactly when you need it |
+| `topologySpreadConstraints` over zones | all replicas land in one AZ |
+| Loki 3 replicas, `replication_factor: 3` | a node drain stops ingestion |
+| Alloy `maxUnavailable: 1` | a DaemonSet rollout blinds the whole fleet at once |
+
+The PriorityClass is created by the overlay itself via `extraManifests`, because
+the built-in `system-cluster-critical` **cannot be used outside `kube-system`** —
+the PodPriority admission controller rejects it.
+
+**Durability**
+
+- Loki on S3 with Pod Identity (Phase 2 above), not the PVC.
+- Prometheus `remoteWrite` to Amazon Managed Prometheus, with
+  `writeRelabelConfigs` dropping `go_*`/`process_*`/`promhttp_*` — you pay per
+  series ingested, and nobody dashboards those. Local retention becomes a fast
+  cache, not the system of record.
+- Alloy's `loki.write` WAL (in the base config) buffers to disk when Loki is
+  unreachable. Marked experimental upstream, and pod-local — it survives a Loki
+  outage, not an Alloy restart.
+
+**Alerting**
+
+kube-prometheus-stack alerts on Kubernetes. Nothing in it alerts on the *logging
+pipeline*, so a dead Loki or a stalled Alloy just looks like quiet logs. The
+overlay adds `LokiDown`, `LokiRequestErrors`, `AlloyDroppingLogs`,
+`AlloyNotRunningOnEveryNode` and `PrometheusRemoteWriteBehind`.
+
+It also adds the Alertmanager routing that makes any of it matter: severity-split
+receivers, `Watchdog` routed to a deadman's-switch rather than a human (it fires
+constantly by design — that is how you prove the alert path still works),
+inhibit rules so a critical does not also send its warning, and keys read from a
+mounted Secret via `routing_key_file`.
+
+**Access**
+
+Grafana behind an internal ALB with ACM TLS, `root_url` matching that hostname,
+`cookie_secure` and HSTS on, and an `auth.generic_oauth` block for your IdP with
+group-to-role mapping. Set `auth.basic.enabled: false` only once SSO works.
+
+### Still yours to do
+
+- Fill every `CHANGEME`: bucket names, ACM cert ARN, hostname, AMP workspace,
+  IdP endpoints.
+- Create the receiver secret: `kubectl -n observability create secret generic
+  alertmanager-receivers --from-literal=pagerduty-key=... --from-literal=slack-webhook=...`
+- Install External Secrets Operator so `grafana-admin` stops being a manual
+  step — see `gitops/examples/`.
+- Decide retention against real volume. 30d local plus AMP is a starting point,
+  not a sizing exercise.
+- Argo CD itself is not managed by this repo. In production it should be.
 
 ## Versions pinned in this lesson
 

@@ -1,0 +1,21 @@
+# Production overlay for Alloy.
+# NOT loaded by apps/30-alloy.yaml. Point a prod Application at
+# values.yaml + this file.
+
+controller:
+  # Defined by the kube-prometheus-stack prod overlay (extraManifests).
+  priorityClassName: observability-critical
+
+  # A DaemonSet rollout should not blind the whole fleet at once.
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+
+alloy:
+  resources:
+    requests: {cpu: 200m, memory: 256Mi}
+    limits:   {memory: 1Gi}
+
+  # The write-ahead log that protects against a Loki outage is in the base
+  # config, since it is worth having in every environment.

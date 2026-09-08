@@ -35,6 +35,9 @@ spec:
       kind: ValidatingWebhookConfiguration
     - group: ""
       kind: Namespace
+    # Created by the prod overlay's extraManifests.
+    - group: scheduling.k8s.io
+      kind: PriorityClass
 
   namespaceResourceWhitelist:
     - group: "*"

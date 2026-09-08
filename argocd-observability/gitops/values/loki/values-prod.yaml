@@ -7,6 +7,15 @@
 # account. That is why it is not in the base file: a plausible-looking
 # placeholder that ships is worse than an absent one.
 
+global:
+  # Defined by the kube-prometheus-stack prod overlay (extraManifests).
+  priorityClassName: observability-critical
+
+# Chart default is already true; stated explicitly because a node drain taking
+# all three replicas at once means log loss, not just downtime.
+podDisruptionBudget:
+  enabled: true
+
 loki:
   commonConfig:
     replication_factor: 3        # must match singleBinary.replicas below
@@ -49,6 +58,15 @@ serviceAccount:
 
 singleBinary:
   replicas: 3                    # HA; requires object storage, configured above
+
+  # Spread across AZs. ScheduleAnyway so a single-AZ cluster still schedules.
+  topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: topology.kubernetes.io/zone
+      whenUnsatisfiable: ScheduleAnyway
+      labelSelector:
+        matchLabels:
+          app.kubernetes.io/component: single-binary
   persistence:
     storageClass: gp3
     size: 20Gi                   # WAL + index cache only; chunks are in S3

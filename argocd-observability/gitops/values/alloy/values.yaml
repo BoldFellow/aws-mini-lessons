@@ -100,6 +100,17 @@ alloy:
           url = "http://loki.observability.svc.cluster.local:3100/loki/api/v1/push"
         }
 
+        // Buffers to disk when Loki is unreachable. Without it, loki.write
+        // retries in memory and eventually drops — a Loki restart costs logs.
+        // NOTE: marked EXPERIMENTAL upstream, and the buffer lives in the
+        // pod's storage path, so it survives a Loki outage, not an Alloy
+        // pod restart. Give the DaemonSet a hostPath if you need that too.
+        wal {
+          enabled         = true
+          max_segment_age = "1h"
+          drain_timeout   = "30s"
+        }
+
         external_labels = {
           cluster = "eks-demo",
         }
