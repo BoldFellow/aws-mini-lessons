@@ -1,15 +1,13 @@
-# Grafana Alloy — the log shipper that feeds Loki.
-#
-# Promtail reached end-of-life on 2 March 2026. Alloy (Grafana's OpenTelemetry
-# Collector distribution) is its replacement and the only supported path for new
-# clusters. `alloy convert` will translate an existing promtail config.
+# Loki does not collect logs — it only accepts pushes. Alloy is the agent that
+# reads /var/log/pods on each node and pushes. Promtail, its predecessor,
+# reached end-of-life on 2 March 2026.
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
   name: alloy
   namespace: argocd
   annotations:
-    argocd.argoproj.io/sync-wave: "2"   # after Loki: it pushes to loki-gateway
+    argocd.argoproj.io/sync-wave: "2"   # after Loki: it pushes to it
   finalizers:
     - resources-finalizer.argocd.argoproj.io
 spec:
@@ -23,8 +21,6 @@ spec:
         releaseName: alloy
         valueFiles:
           - $values/argocd-observability/gitops/values/alloy/values.yaml
-          - $values/argocd-observability/gitops/values/alloy/values-dev.yaml
-        ignoreMissingValueFiles: true
 
     - repoURL: https://github.com/BoldFellow/aws-mini-lessons.git
       targetRevision: main
@@ -41,13 +37,6 @@ spec:
     syncOptions:
       - CreateNamespace=true
       - ServerSideApply=true
-      - PrunePropagationPolicy=foreground
-      - PruneLast=true
     retry:
       limit: 5
-      backoff:
-        duration: 15s
-        factor: 2
-        maxDuration: 5m
-
-  revisionHistoryLimit: 10
+      backoff: {duration: 15s, factor: 2, maxDuration: 5m}

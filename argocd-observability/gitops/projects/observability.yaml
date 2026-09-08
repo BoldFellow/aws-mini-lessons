@@ -1,31 +1,29 @@
-# AppProject: a security boundary for the observability stack.
-# It whitelists exactly which repos may be deployed from, which namespaces
-# may be written to, and which cluster-scoped kinds are allowed.
-# Best practice: never leave production apps in the built-in `default` project,
-# which permits any repo, any cluster, any namespace, any resource kind.
+# Restricts what these Applications may deploy, and from where. Without a
+# project they land in `default`, which allows any repo, any namespace, any
+# resource kind — and Argo CD usually runs as cluster-admin.
 apiVersion: argoproj.io/v1alpha1
 kind: AppProject
 metadata:
   name: observability
   namespace: argocd
 spec:
-  description: Cluster observability stack (metrics, logs, dashboards)
+  description: Cluster observability stack
 
   sourceRepos:
-    - https://github.com/BoldFellow/aws-mini-lessons.git    # values files (this repo)
-    - https://prometheus-community.github.io/helm-charts    # kube-prometheus-stack, CRDs
-    - https://grafana-community.github.io/helm-charts       # loki (OSS chart, see apps/loki.yaml)
-    - https://grafana.github.io/helm-charts                 # alloy
+    - https://github.com/BoldFellow/aws-mini-lessons.git
+    - https://prometheus-community.github.io/helm-charts
+    - https://grafana-community.github.io/helm-charts
+    - https://grafana.github.io/helm-charts
 
   destinations:
     - server: https://kubernetes.default.svc
       namespace: observability
     - server: https://kubernetes.default.svc
-      namespace: kube-system          # kubelet/cadvisor ServiceMonitors land here
+      namespace: kube-system      # kubelet ServiceMonitor lands here
+    - server: https://kubernetes.default.svc
+      namespace: argocd           # the root app creates Applications here
 
-  # CRDs, ClusterRoles, webhook configs and PSP-replacement resources are all
-  # cluster-scoped. The operator genuinely needs them, so allow them explicitly
-  # rather than granting '*'.
+  # The operator needs these. Anything not listed is rejected.
   clusterResourceWhitelist:
     - group: apiextensions.k8s.io
       kind: CustomResourceDefinition
@@ -37,29 +35,9 @@ spec:
       kind: MutatingWebhookConfiguration
     - group: admissionregistration.k8s.io
       kind: ValidatingWebhookConfiguration
-    - group: storage.k8s.io
-      kind: StorageClass
     - group: ""
       kind: Namespace
-    - group: scheduling.k8s.io
-      kind: PriorityClass
 
   namespaceResourceWhitelist:
     - group: "*"
       kind: "*"
-
-  # Surface resources living in the project's namespaces that no Application
-  # claims — usually leftovers from a manual kubectl apply. Warn only; Argo CD
-  # will not delete them.
-  orphanedResources:
-    warn: true
-    ignore:
-      # Argo CD does not track the PVCs a StatefulSet's volumeClaimTemplate
-      # creates, so every Prometheus/Loki volume would show up as orphaned.
-      - group: ""
-        kind: PersistentVolumeClaim
-      # Created by the EBS CSI driver and by kubelet, not by us.
-      - group: ""
-        kind: Endpoints
-      - group: discovery.k8s.io
-        kind: EndpointSlice

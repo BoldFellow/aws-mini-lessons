@@ -1,0 +1,62 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: kube-prometheus-stack
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: observability
+
+  # Two sources: the chart from upstream, the values from this git repo.
+  # `ref: values` defines $values. A bare `values.yaml` here would resolve
+  # INSIDE the chart (its own defaults) and your values would never load.
+  sources:
+    - repoURL: https://prometheus-community.github.io/helm-charts
+      chart: kube-prometheus-stack
+      targetRevision: 90.0.0
+      helm:
+        releaseName: kube-prometheus-stack
+        valueFiles:
+          - $values/argocd-observability/gitops/values/kube-prometheus-stack/values.yaml
+
+    - repoURL: https://github.com/BoldFellow/aws-mini-lessons.git
+      targetRevision: main
+      ref: values
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: observability
+
+  syncPolicy:
+    # node-exporter needs hostNetwork/hostPID, so this namespace can't be
+    # Pod Security 'baseline'. Say so, rather than leaving it unlabelled.
+    managedNamespaceMetadata:
+      labels:
+        pod-security.kubernetes.io/enforce: privileged
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      # Required. The Prometheus CRDs exceed the 262144-byte annotation limit
+      # under client-side apply ("metadata.annotations: Too long").
+      - ServerSideApply=true
+      - RespectIgnoreDifferences=true
+    retry:
+      limit: 5
+      backoff: {duration: 15s, factor: 2, maxDuration: 5m}
+
+  # The operator injects its own CA bundle here at runtime. Without this the
+  # app flips between Synced and OutOfSync forever.
+  ignoreDifferences:
+    - group: admissionregistration.k8s.io
+      kind: ValidatingWebhookConfiguration
+      name: kube-prometheus-stack-admission
+      jqPathExpressions: ['.webhooks[]?.clientConfig.caBundle']
+    - group: admissionregistration.k8s.io
+      kind: MutatingWebhookConfiguration
+      name: kube-prometheus-stack-admission
+      jqPathExpressions: ['.webhooks[]?.clientConfig.caBundle']

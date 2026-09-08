@@ -1,52 +1,21 @@
-# GitOps repository layout
+# GitOps layout
 
 ```
-argocd-observability/gitops/
-├── bootstrap/
-│   └── root-app.yaml                  # app-of-apps — the only manifest applied by hand
-├── projects/
-│   ├── bootstrap.yaml                 # AppProject for the root app: Applications only
-│   └── observability.yaml             # AppProject for the stack: repo/namespace/kind allowlist
-├── apps/                              # Argo CD Applications, one file per component
-│   ├── 00-prometheus-operator-crds.yaml   # sync-wave -2
-│   ├── 10-kube-prometheus-stack.yaml      # sync-wave  0
-│   ├── 20-loki.yaml                       # sync-wave  1
-│   └── 30-alloy.yaml                      # sync-wave  2
-└── values/                            # Helm values, kept OUT of the app manifests
-    ├── kube-prometheus-stack/
-    │   ├── values.yaml                # base — safe regardless of how it is reached
-    │   ├── values-dev.yaml            # loaded by the Application in apps/
-    │   └── values-prod.yaml           # NOT loaded; template for a prod Application
-    ├── loki/
-    │   └── values.yaml
-    └── alloy/
-        └── values.yaml
+gitops/
+├── bootstrap/root-app.yaml        # app-of-apps — the only manual apply
+├── projects/observability.yaml    # AppProject: repo/namespace/kind allowlist
+├── apps/                          # one Application per component
+│   ├── kube-prometheus-stack.yaml # sync-wave 0
+│   ├── loki.yaml                  # sync-wave 1
+│   └── alloy.yaml                 # sync-wave 2
+└── values/<app>/values.yaml       # Helm values, kept out of the manifests
 ```
 
-## Why this shape
+`apps/` says *what and where*; `values/` says *how*. Reviewing a tuning change
+then doesn't mean re-reviewing sync policy. Argo CD orders by sync-wave, not by
+filename.
 
-**`apps/` is separate from `values/`.** The `Application` manifest answers
-*what and where*; the values file answers *how*. Reviewing a values change then
-does not mean re-reviewing sync policy, and vice versa. The numeric filename
-prefixes are for humans reading `ls` — Argo CD orders by sync-wave, not by name.
-
-**Values live in git, not inline in the Application.** You *can* inline them
-with `helm.valuesObject`, but then every tuning change edits an Argo CD CRD, you
-lose YAML schema support in your editor, and `helm template -f` becomes
-impossible to run locally. Keep them as real files.
-
-**Charts are consumed, never forked.** Multi-source (`ref: values`) combines an
-upstream chart with local values. Vendoring a copy of kube-prometheus-stack into
-this repo means manually tracking upstream releases forever.
-
-**One AppProject per blast radius.** `default` allows any repo, any cluster, any
-namespace, any kind. The `observability` project names four repos and two
-namespaces; anything else is rejected at admission. The root app gets its own
-`bootstrap` project that can create nothing but `argoproj.io/Application` in the
-`argocd` namespace — so a bad commit under `apps/` cannot turn into a Deployment
-or a ClusterRole.
-
-## The multi-source pattern, precisely
+## The multi-source pattern
 
 ```yaml
 sources:
@@ -61,55 +30,34 @@ sources:
     ref: values           # defines $values
 ```
 
-Rules that are easy to get wrong:
+**The trap:** for a chart from a Helm repo, a bare `values.yaml` in `valueFiles`
+resolves relative to the *chart root* — the chart's own defaults, which Helm
+already loads. It does not pull `values.yaml` from your git repo. The app syncs,
+reports Healthy, and deploys pure upstream defaults. Use the `$values` form.
 
-| Rule | Consequence if broken |
-|---|---|
-| `$values` may only appear at the **start** of the path | Path is not substituted; Helm errors on a missing file |
-| `$values` resolves to the **root of the ref'd repo**, ignoring its `path` | Silently reads the wrong file |
-| A source with `ref` must **not** also set `chart` | Argo CD rejects the Application |
-| When `sources` is set, the singular `source` field is **ignored** | Your edits to `source:` do nothing |
-| Keep it to 2–3 sources | Multi-source is not a grouping mechanism — use app-of-apps |
+Other rules worth knowing: `$values` only at the start of a path; it resolves to
+the ref'd repo's root regardless of that source's `path`; a `ref` source must not
+also set `chart`; and when `sources` is set, the singular `source` is ignored.
 
-### The `valueFiles: [values.yaml]` trap
-
-For a chart pulled from a Helm repo, a bare `values.yaml` in `valueFiles`
-resolves **relative to the chart root** — that is, the chart's own default
-values file, which Helm already loads. It does *not* pull `values.yaml` from
-your git repo. The Application syncs, reports Healthy, and applies pure
-upstream defaults. Use the `$values` form above instead.
-
-## What belongs in the base file vs. an overlay
-
-The split is not dev-vs-prod convenience, it is **whether the setting depends on
-a fact this repo cannot know**. `cookie_secure: true` is objectively more secure
-and still belongs in `values-prod.yaml`, because it silently breaks the session
-cookie unless Grafana is genuinely reached over HTTPS. A hardening setting
-applied to the wrong deployment shape is an outage, not a hardening.
-
-So: base carries what is true everywhere; the overlay carries hostnames, TLS
-assumptions, IdP endpoints and replica counts. A placeholder that looks
-plausible is worse than an absent value, because the plausible one ships.
-
-## Credentials
-
-No AWS credentials appear anywhere in this tree — no access keys, and with EKS
-Pod Identity, not even a role ARN. The namespace + ServiceAccount → IAM role
-mapping lives in the EKS control plane, so the same values files deploy into a
-different AWS account unchanged. Grafana's admin password comes from a Secret
-created out of band (or via External Secrets Operator), never from a values file.
-
-## Value precedence
-
-`parameters` > `valuesObject` > `values` > `valueFiles` (later files win) >
-the chart's own `values.yaml`.
+Value precedence: `parameters` > `valuesObject` > `values` > `valueFiles`
+(later files win) > the chart's own `values.yaml`.
 
 ## Bootstrap
 
 ```bash
-kubectl apply -f projects/bootstrap.yaml
 kubectl apply -f projects/observability.yaml
 kubectl apply -f bootstrap/root-app.yaml
 ```
 
-Everything else is pulled in by the root app.
+## Adding an environment
+
+Add `values/<app>/values-prod.yaml`, list it after `values.yaml` in a second
+Application's `valueFiles`, and set `ignoreMissingValueFiles: true`. Keep in the
+overlay anything that depends on a fact this repo can't know — hostnames, TLS
+assumptions, IdP endpoints, replica counts.
+
+## Credentials
+
+No AWS credentials anywhere in this tree: EKS Pod Identity binds the IAM role
+from the AWS side, so not even a role ARN appears here. Grafana's admin password
+comes from a Secret created out of band.

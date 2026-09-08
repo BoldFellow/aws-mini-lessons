@@ -1,34 +1,26 @@
-# App-of-apps root. This is the ONLY manifest you apply by hand:
-#
-#   kubectl apply -f argocd-observability/gitops/projects/observability.yaml
-#   kubectl apply -f argocd-observability/gitops/bootstrap/root-app.yaml
-#
-# From then on, everything under apps/ is managed by Argo CD itself.
+# App-of-apps root. The only manifest you apply by hand:
+#   kubectl apply -f projects/observability.yaml
+#   kubectl apply -f bootstrap/root-app.yaml
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
   name: observability-root
   namespace: argocd
   finalizers:
-    # Cascade-delete the child Applications (and their workloads) if this app
-    # is deleted. Remove this line if you want deleting the root to be harmless.
+    # Deleting this app also deletes the whole stack.
     - resources-finalizer.argocd.argoproj.io
 spec:
-  project: bootstrap
+  project: observability
   source:
     repoURL: https://github.com/BoldFellow/aws-mini-lessons.git
     targetRevision: main
     path: argocd-observability/gitops/apps
     directory:
       recurse: true
-      include: '*.yaml'
   destination:
     server: https://kubernetes.default.svc
-    namespace: argocd            # the child Application CRs live in argocd
+    namespace: argocd
   syncPolicy:
     automated:
       prune: true
       selfHeal: true
-    syncOptions:
-      - CreateNamespace=false
-  revisionHistoryLimit: 10

@@ -20,7 +20,6 @@ flowchart LR
   end
 
   subgraph EKS["Amazon EKS — namespace: observability"]
-    CRD["prometheus-operator-crds<br/>wave -2"]
     KPS["kube-prometheus-stack<br/>Prometheus · Alertmanager · Grafana<br/>wave 0"]
     LOKI["Loki (Monolithic)<br/>wave 1"]
     AL["Alloy DaemonSet<br/>wave 2"]
@@ -38,7 +37,7 @@ flowchart LR
   GC --> ARGO
   GR --> ARGO
 
-  ARGO ==> CRD ==> KPS ==> LOKI ==> AL
+  ARGO ==> KPS ==> LOKI ==> AL
 
   AL -->|"push logs"| LOKI
   KPS -->|"scrape /metrics"| LOKI
@@ -52,8 +51,8 @@ flowchart LR
 
 - The **app-of-apps** pattern: one root Application that manages all the others
 - **Multi-source Applications**: an upstream Helm chart + your git-hosted values
-- **Sync waves** for ordering CRDs → operator → Loki → log shipper
-- Why kube-prometheus-stack needs **ServerSideApply** and split-out CRDs
+- **Sync waves** for ordering operator → Loki → log shipper
+- Why kube-prometheus-stack needs **ServerSideApply**
 - The EKS-specific settings that stop four alerts firing forever on day one
 - Loki on **S3 with EKS Pod Identity** — no access keys, no role ARNs in git
 
@@ -313,20 +312,15 @@ kubectl -n observability create secret generic grafana-admin \
   --from-literal=admin-password="$(openssl rand -base64 24)"
 ```
 
-This command is the one genuinely non-reproducible step in the lesson, and it
-is deliberate: the *value* must not be in git, and a repo cannot know which
-secret store you use. For real clusters, put it in AWS Secrets Manager and pull
-it in with External Secrets Operator — see
-[`gitops/examples/external-secret-grafana-admin.yaml`](gitops/examples/external-secret-grafana-admin.yaml)
-for the manifest that replaces this command. ESO is not installed by this lesson
-because it is a chart plus its own IAM role, which is a lesson of its own.
+This is the one non-reproducible step, and deliberately so: the *value* must not
+be in git. For real clusters, keep it in AWS Secrets Manager and pull it in with
+External Secrets Operator.
 
 ## Step 5 — Commit and bootstrap
 
 ```bash
 git add argocd-observability && git commit -m "observability stack" && git push
 
-kubectl apply -f argocd-observability/gitops/projects/bootstrap.yaml
 kubectl apply -f argocd-observability/gitops/projects/observability.yaml
 kubectl apply -f argocd-observability/gitops/bootstrap/root-app.yaml
 ```
@@ -340,10 +334,9 @@ kubectl -n argocd get applications -w
 Expected order (this is sync waves doing their job):
 
 ```
-prometheus-operator-crds   Synced   Healthy    # wave -2
-kube-prometheus-stack      Synced   Healthy    # wave  0
-loki                       Synced   Healthy    # wave  1
-alloy                      Synced   Healthy    # wave  2
+kube-prometheus-stack      Synced   Healthy    # wave 0
+loki                       Synced   Healthy    # wave 1
+alloy                      Synced   Healthy    # wave 2
 ```
 
 ## Step 6 — Verify
@@ -411,18 +404,19 @@ git.** That is the whole point.
 
 ## Design decisions worth defending in review
 
-### CRDs are their own Application, in wave -2
+### `ServerSideApply=true` is not optional here
 
-The Prometheus CRDs are over 1 MB. Client-side apply writes a full copy into the
-`kubectl.kubernetes.io/last-applied-configuration` annotation and hits the
-262144-byte limit — the classic `metadata.annotations: Too long` failure.
-`ServerSideApply=true` removes that annotation from the picture entirely.
+The Prometheus CRDs are over 1 MB. Client-side apply writes a full copy of each
+object into its `kubectl.kubernetes.io/last-applied-configuration` annotation
+and hits the 262144-byte limit — the classic `metadata.annotations: Too long`
+failure. Server-side apply doesn't use that annotation at all.
 
-Splitting them out also fixes a Helm limitation: charts do not upgrade CRDs in
-their `crds/` directory. As a separate chart, a CRD bump is an ordinary sync.
-`crds.enabled: false` in the stack's values prevents double ownership, and
-`prune: false` on the CRD app means a mis-sync can never cascade-delete every
-`ServiceMonitor` in the cluster.
+At larger scale you'd also split the CRDs into a separate Application using the
+`prometheus-operator-crds` chart, with `crds.enabled: false` here. That buys you
+CRD upgrades (Helm won't upgrade CRDs shipped in a chart's `crds/` directory)
+and lets you set `prune: false` on them so a mis-sync can't cascade-delete every
+ServiceMonitor in the cluster. It's a real production concern and unnecessary
+weight for one cluster.
 
 ### Four EKS components are disabled
 
@@ -494,31 +488,33 @@ The OSS Loki Helm chart moved from `grafana/helm-charts` to
 there). The chart still published at `grafana.github.io/helm-charts` is now
 maintained for Grafana Enterprise Logs. This lesson uses the community chart.
 
-## What this is NOT yet, before you run it in production
+## Before this is production
 
-Everything above is production-shaped, but a lab is not a production install.
-The honest gap list, roughly in the order I would close it:
+This is a working lab install, not a production one. The gaps that matter most:
 
-| Gap | Why it matters | Fix |
-|---|---|---|
-| **Alertmanager has no receivers** | Every alert fires into the default null route. You have monitoring that cannot page anyone. | `alertmanager.config` with a real receiver + `route`; store the webhook/SMTP creds in a Secret, not in values |
-| **Grafana `root_url` unset** | Grafana builds absolute redirects and alert links from it; a wrong value sends users to a host that does not resolve. Left unset so the port-forward in Step 6 works | Set it in `values-prod.yaml` alongside the Ingress you terminate TLS on |
-| **No SSO** | `auth.basic` plus one shared admin password is the whole access model, and it is in a Secret anyone with namespace RBAC can read | `values-prod.yaml` has a filled-in `auth.generic_oauth` template; set `auth.basic.enabled: false` once it works |
-| **Secrets are created by hand** | `grafana-admin` exists because someone ran a command once — not in git, not reproducible, never rotated | `gitops/examples/external-secret-grafana-admin.yaml` |
-| **Loki is a single replica** | `singleBinary.replicas: 1` and `replication_factor: 1` — a node drain loses in-flight logs and stops ingestion | SimpleScalable or Distributed mode, replication_factor 3 |
-| **No TLS between components** | Alloy → Loki and Prometheus → targets are plain HTTP inside the cluster | A service mesh, or the charts' own TLS settings |
-| **Prometheus has no long-term storage** | 15 days on one EBS volume, gone if the PVC is | `remote_write` to Amazon Managed Prometheus or Thanos |
-| **`prune: true` everywhere** | A bad merge that deletes a file deletes the workload | Branch protection on the values path, and consider `prune: false` on stateful apps |
+- **Alertmanager has no receivers** — every alert routes to null. Monitoring
+  that cannot page anyone. Close this first.
+- **Loki is a single replica** with `replication_factor: 1`. A node drain stops
+  ingestion. SimpleScalable or Distributed mode fixes it.
+- **No SSO and no Ingress** — one shared admin password, reached by
+  port-forward. Wire `auth.generic_oauth` to your IdP, then set
+  `grafana.ini.server.root_url` and `security.cookie_secure: true` (both need
+  real HTTPS — setting them without it breaks the session cookie).
+- **Loki has no auth** and the HTTP API is open to anything in the cluster.
+  `auth_enabled` only controls whether Loki *requires* a tenant header, not
+  whether it verifies anyone. Add a NetworkPolicy if other teams share this
+  cluster.
+- **Prometheus keeps 15 days on one EBS volume.** For longer, `remote_write` to
+  Amazon Managed Prometheus.
 
-The NetworkPolicy, Pod Identity, PSA labels, TLS-only buckets, scoped IAM and
-host-mount minimisation are already in place — those were worth doing up front
-because retrofitting them means downtime.
+Already handled, because retrofitting them means downtime: Pod Identity instead
+of static keys, scoped IAM, TLS-only buckets, Pod Security labels, and the
+compactor actually enforcing retention.
 
 ## Versions pinned in this lesson
 
 | Chart | Repo | Version | App version |
 |---|---|---|---|
-| `prometheus-operator-crds` | prometheus-community | 31.0.1 | — |
 | `kube-prometheus-stack` | prometheus-community | 90.0.0 | operator v0.93.1 |
 | `loki` | grafana-community | 18.12.1 | Loki 3.7.7 |
 | `alloy` | grafana | 1.12.1 | Alloy v1.19.2 |

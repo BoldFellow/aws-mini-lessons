@@ -1,18 +1,14 @@
-# Loki, OSS chart.
-#
-# IMPORTANT (March 2026): the OSS Loki Helm chart moved out of grafana/helm-charts
-# to the community fork at grafana-community/helm-charts (forked at chart 6.55.0
-# and versioned independently from there — hence the 18.x version numbers).
-# The `loki` chart still published from grafana.github.io is now maintained for
-# Grafana Enterprise Logs. The old `loki-stack` chart (2.10.3) is deprecated and
-# ships an EOL Promtail — do not start new work on it.
+# The OSS Loki chart moved to grafana-community/helm-charts in March 2026
+# (forked at 6.55.0, hence the 18.x numbering). The `loki` chart still at
+# grafana.github.io is now Grafana Enterprise Logs. `loki-stack` is deprecated
+# and ships an EOL Promtail.
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
   name: loki
   namespace: argocd
   annotations:
-    argocd.argoproj.io/sync-wave: "1"   # after kube-prometheus-stack: it defines ServiceMonitor
+    argocd.argoproj.io/sync-wave: "1"   # after kps, which defines ServiceMonitor
   finalizers:
     - resources-finalizer.argocd.argoproj.io
 spec:
@@ -26,8 +22,6 @@ spec:
         releaseName: loki
         valueFiles:
           - $values/argocd-observability/gitops/values/loki/values.yaml
-          - $values/argocd-observability/gitops/values/loki/values-dev.yaml
-        ignoreMissingValueFiles: true
 
     - repoURL: https://github.com/BoldFellow/aws-mini-lessons.git
       targetRevision: main
@@ -45,19 +39,13 @@ spec:
       - CreateNamespace=true
       - ServerSideApply=true
       - RespectIgnoreDifferences=true
-      - PrunePropagationPolicy=foreground
-      - PruneLast=true
     retry:
       limit: 5
-      backoff:
-        duration: 15s
-        factor: 2
-        maxDuration: 5m
+      backoff: {duration: 15s, factor: 2, maxDuration: 5m}
 
+  # The API server stamps these onto volumeClaimTemplates. Ignoring the whole
+  # block instead would also hide a real storage-size change.
   ignoreDifferences:
-    # The API server stamps these onto each volumeClaimTemplate. Ignore only
-    # those fields — ignoring the whole block would also hide a real storage
-    # size change, so drift in `resources.requests.storage` would go unnoticed.
     - group: apps
       kind: StatefulSet
       jqPathExpressions:
@@ -65,5 +53,3 @@ spec:
         - .spec.volumeClaimTemplates[]?.kind
         - .spec.volumeClaimTemplates[]?.metadata.creationTimestamp
         - .spec.volumeClaimTemplates[]?.status
-
-  revisionHistoryLimit: 10

@@ -1,164 +1,78 @@
-# Loki values — Monolithic mode backed by S3, on Amazon EKS.
-# Chart: grafana-community/loki 18.12.1 (Loki 3.7.x)
+# Loki 18.12.1 (grafana-community), Monolithic mode on S3.
 #
-# Deployment modes:
-#   Monolithic      — one binary, up to ~tens of GB/day. Use this to learn.
-#   SimpleScalable  — read/write/backend split, up to ~1 TB/day. (Removed in Loki 4.)
-#   Distributed     — full microservices, >1 TB/day.
-# SimpleScalable and Distributed REQUIRE object storage; Monolithic works with
-# it too and you should use S3 from day one so nothing is lost when a pod moves.
+# Modes: Monolithic (tens of GB/day) · SimpleScalable (~1TB/day, removed in
+# Loki 4) · Distributed (>1TB/day). The latter two require object storage;
+# use it here anyway so chunks survive the pod moving.
 deploymentMode: Monolithic
 
 loki:
-  # Single tenant. Loki has no built-in authentication either way: auth_enabled
-  # controls whether it REQUIRES an X-Scope-OrgID tenant header, not whether it
-  # verifies anyone. Real isolation comes from the NetworkPolicy below plus an
-  # authenticating proxy in front. Set true if more than one team shares this.
-  auth_enabled: false
+  auth_enabled: false          # single tenant
 
   commonConfig:
-    replication_factor: 1        # one instance in Monolithic mode
+    replication_factor: 1
 
-  # schemaConfig is MANDATORY for any real install — the chart ships an empty
-  # one on purpose. v13 + tsdb is the only combination you should start with.
-  # Never edit an existing entry: add a NEW entry with a future `from` date.
+  # MANDATORY — the chart ships an empty schemaConfig on purpose. Never edit an
+  # existing entry; append a new one with a future `from` date.
   schemaConfig:
     configs:
       - from: "2024-04-01"
         store: tsdb
         object_store: s3
         schema: v13
-        index:
-          prefix: index_
-          period: 24h
+        index: {prefix: index_, period: 24h}
 
   storage:
     type: s3
     bucketNames:
-      chunks: CHANGEME-loki-chunks     # must already exist; see lesson.md step 3
+      chunks: CHANGEME-loki-chunks     # see lesson.md step 3
       ruler: CHANGEME-loki-ruler
     s3:
       region: eu-central-1
-      # Deliberately NO accessKeyId / secretAccessKey. Credentials are delivered
-      # by EKS Pod Identity — see serviceAccount below. Static keys in a values
-      # file end up in git, in the rendered manifest and in a Secret, and they
-      # never rotate.
-      s3ForcePathStyle: false
-      insecure: false
+      # No keys on purpose — EKS Pod Identity supplies credentials.
 
   limits_config:
-    retention_period: 744h            # 31 days; 0s = keep forever
-    volume_enabled: true              # powers Grafana's log-volume histogram
-    reject_old_samples: true
-    reject_old_samples_max_age: 168h
-    max_query_series: 5000
-    ingestion_rate_mb: 8
-    ingestion_burst_size_mb: 16
+    retention_period: 744h       # 31 days
+    volume_enabled: true         # Grafana's log-volume histogram
 
-  # Retention is only ENFORCED if the compactor is told to do it.
-  # Without these two lines your retention_period above is decorative and the
-  # S3 bill grows forever.
+  # retention_period above does NOTHING without this. Otherwise the S3 bill
+  # grows forever while Grafana quietly hides the old data.
   compactor:
     retention_enabled: true
     delete_request_store: s3
 
-  # Turn off the phone-home usage report.
   analytics:
     reporting_enabled: false
 
-## ---------------------------------------------------------------------------
-## IAM: EKS Pod Identity
-## ---------------------------------------------------------------------------
-# Note there is NO eks.amazonaws.com/role-arn annotation here. That is IRSA.
-# Pod Identity binds the role to this ServiceAccount from the AWS side, via a
-# PodIdentityAssociation (lesson.md step 3) — the cluster manifest stays free of
-# account IDs and role ARNs, which is why the same values file works unchanged
-# across dev/staging/prod accounts.
-#
-# The association is keyed on namespace + ServiceAccount NAME, so this name is
-# load-bearing: change it here and the association must change with it.
+# Pod Identity binds the IAM role from the AWS side — no role-arn annotation
+# here (that would be IRSA). The association keys on namespace + this name.
 serviceAccount:
   create: true
   name: loki
 
-# Pod Identity requires the eks-pod-identity-agent DaemonSet, which cannot run
-# on Fargate or Windows nodes. If Loki must run on Fargate, stay on IRSA for
-# this workload: add the eks.amazonaws.com/role-arn annotation above instead.
-# Never set both — Pod Identity wins, but the ambiguity costs someone an hour.
-
-## ---------------------------------------------------------------------------
-## Monolithic component
-## ---------------------------------------------------------------------------
 singleBinary:
   replicas: 1
   persistence:
     enabled: true
     storageClass: gp3
-    size: 20Gi          # WAL + local index cache only; chunks live in S3
+    size: 20Gi          # WAL + index cache; chunks live in S3
   resources:
-    requests:
-      cpu: 500m
-      memory: 1Gi
-    limits:
-      memory: 2Gi
+    requests: {cpu: 500m, memory: 1Gi}
+    limits:   {memory: 2Gi}
 
-# Zero out the scalable-mode components so the chart does not template them.
-write:
-  replicas: 0
-read:
-  replicas: 0
-backend:
-  replicas: 0
-
-# nginx in front of Loki. Keep it: it gives you one stable URL for both the
-# push path (Alloy) and the query path (Grafana).
+# nginx in front of Loki. Only useful in SimpleScalable/Distributed, where read
+# and write are separate pods needing one address. With one pod it is a wasted
+# hop, so clients talk to the `loki` Service on :3100 directly.
 gateway:
-  enabled: true
-  replicas: 1
-
-## ---------------------------------------------------------------------------
-## Caches
-## ---------------------------------------------------------------------------
-# The chart's memcached caches default to ON and request several GB each. That
-# is correct for SimpleScalable at scale and wildly oversized for a lab or a
-# small Monolithic install — a very common cause of "why is nothing scheduling".
-chunksCache:
-  enabled: false
-resultsCache:
   enabled: false
 
-## ---------------------------------------------------------------------------
-## Network policy
-## ---------------------------------------------------------------------------
-# This matters BECAUSE auth_enabled is false. Loki's HTTP API is unauthenticated
-# and the gateway does not add auth, so without a NetworkPolicy any pod in the
-# cluster can push forged logs or read everyone's. Restrict ingress to the
-# observability namespace, which is where Alloy (push) and Grafana (query) live.
-networkPolicy:
-  enabled: true
-  ingress:
-    namespaceSelector:
-      matchLabels:
-        kubernetes.io/metadata.name: observability
-  metrics:
-    namespaceSelector:
-      matchLabels:
-        kubernetes.io/metadata.name: observability
-  externalStorage:
-    ports:
-      - 443          # egress to S3
+# These memcached caches default to ON and request several GB each — correct at
+# scale, but on a small cluster they simply never schedule.
+chunksCache: {enabled: false}
+resultsCache: {enabled: false}
 
-## ---------------------------------------------------------------------------
-## Self-monitoring
-## ---------------------------------------------------------------------------
 monitoring:
   serviceMonitor:
-    enabled: true       # picked up by Prometheus (selectors are open, see kps values)
+    enabled: true
 
-# The canary writes synthetic logs to prove the pipeline is alive. Useful in
-# production, noise in a lab.
-lokiCanary:
-  enabled: false
-
-test:
-  enabled: false
+lokiCanary: {enabled: false}
+test: {enabled: false}
