@@ -75,6 +75,23 @@ gateway:
 chunksCache: {enabled: false}
 resultsCache: {enabled: false}
 
+# Loki's HTTP API is unauthenticated — auth_enabled only controls whether it
+# REQUIRES a tenant header, not whether it verifies anyone. Without this, any
+# pod in the cluster can push forged logs or read everyone's. Restrict ingress
+# to the namespace where Alloy (push) and Grafana (query) live.
+networkPolicy:
+  enabled: true
+  ingress:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: observability
+  metrics:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: observability
+  externalStorage:
+    ports: [443]        # egress to S3 once you move off filesystem
+
 monitoring:
   serviceMonitor:
     enabled: true

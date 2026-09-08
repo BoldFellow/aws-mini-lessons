@@ -143,13 +143,17 @@ kubectl -n observability create secret generic grafana-admin \
 
 This is the one non-reproducible step, and deliberately so: the *value* must not
 be in git. For real clusters, keep it in AWS Secrets Manager and pull it in with
-External Secrets Operator.
+External Secrets Operator —
+[`gitops/examples/external-secret-grafana-admin.yaml`](gitops/examples/external-secret-grafana-admin.yaml)
+is the manifest that replaces this command. ESO itself is not installed here:
+it is a chart plus its own IAM role.
 
 ## Step 4 — Commit and bootstrap
 
 ```bash
 git add argocd-observability && git commit -m "observability stack" && git push
 
+kubectl apply -f argocd-observability/gitops/projects/bootstrap.yaml
 kubectl apply -f argocd-observability/gitops/projects/observability.yaml
 kubectl apply -f argocd-observability/gitops/bootstrap/root-app.yaml
 ```
@@ -163,9 +167,10 @@ kubectl -n argocd get applications -w
 Expected order (this is sync waves doing their job):
 
 ```
-kube-prometheus-stack      Synced   Healthy    # wave 0
-loki                       Synced   Healthy    # wave 1
-alloy                      Synced   Healthy    # wave 2
+prometheus-operator-crds   Synced   Healthy    # wave -2
+kube-prometheus-stack      Synced   Healthy    # wave  0
+loki                       Synced   Healthy    # wave  1
+alloy                      Synced   Healthy    # wave  2
 ```
 
 ## Step 5 — Verify
@@ -460,19 +465,27 @@ IAM entirely.
 
 ## Design decisions worth defending in review
 
-### `ServerSideApply=true` is not optional here
+### CRDs are their own Application, in wave -2
 
 The Prometheus CRDs are over 1 MB. Client-side apply writes a full copy of each
 object into its `kubectl.kubernetes.io/last-applied-configuration` annotation
 and hits the 262144-byte limit — the classic `metadata.annotations: Too long`
-failure. Server-side apply doesn't use that annotation at all.
+failure. `ServerSideApply=true` doesn't use that annotation at all, and is not
+optional here.
 
-At larger scale you'd also split the CRDs into a separate Application using the
-`prometheus-operator-crds` chart, with `crds.enabled: false` here. That buys you
-CRD upgrades (Helm won't upgrade CRDs shipped in a chart's `crds/` directory)
-and lets you set `prune: false` on them so a mis-sync can't cascade-delete every
-ServiceMonitor in the cluster. It's a real production concern and unnecessary
-weight for one cluster.
+Splitting them out also fixes a Helm limitation: charts do not upgrade CRDs in
+their `crds/` directory, so as a separate chart a CRD bump is an ordinary sync.
+`crds.enabled: false` in the stack's values prevents double ownership, and
+`prune: false` on the CRD app means a mis-sync can never cascade-delete every
+`ServiceMonitor` in the cluster.
+
+### Two AppProjects
+
+`default` permits any repo, any namespace, any kind — and Argo CD usually runs
+as cluster-admin. `observability` names four repos and two namespaces. The root
+app gets a narrower `bootstrap` project that can create nothing but
+`argoproj.io/Application` in `argocd`, so a bad commit under `apps/` cannot
+render into a Deployment or a ClusterRole.
 
 ### Four EKS components are disabled
 
@@ -565,18 +578,22 @@ maintained for Grafana Enterprise Logs. This lesson uses the community chart.
 
 This is a working lab install, not a production one. The gaps that matter most:
 
-- **Alertmanager has no receivers** — every alert routes to null. Monitoring
-  that cannot page anyone. Close this first.
+- **Alertmanager receivers.** `values-prod.yaml` carries a full routing tree
+  (severity split, Watchdog to a deadman's switch, inhibit rules, keys read
+  from a mounted Secret). The dev overlay does not — so in the POC, alerts
+  still route to null. Wire a real receiver before trusting any of this.
 - **Loki is a single replica** with `replication_factor: 1`. A node drain stops
-  ingestion. SimpleScalable or Distributed mode fixes it.
+  ingestion. `values-prod.yaml` moves to 3 replicas on S3; more than one replica
+  requires object storage.
 - **No SSO and no Ingress** — one shared admin password, reached by
-  port-forward. Wire `auth.generic_oauth` to your IdP, then set
-  `grafana.ini.server.root_url` and `security.cookie_secure: true` (both need
-  real HTTPS — setting them without it breaks the session cookie).
-- **Loki has no auth** and the HTTP API is open to anything in the cluster.
-  `auth_enabled` only controls whether Loki *requires* a tenant header, not
-  whether it verifies anyone. Add a NetworkPolicy if other teams share this
-  cluster.
+  port-forward. `values-prod.yaml` has a filled-in `auth.generic_oauth` block
+  with group-to-role mapping; it needs your IdP's endpoints. `root_url` and
+  `cookie_secure` are in there too and both require real HTTPS — setting them
+  without it breaks the session cookie.
+- **Loki has no auth.** `auth_enabled` only controls whether Loki *requires* a
+  tenant header, not whether it verifies anyone. A NetworkPolicy restricting
+  ingress to the `observability` namespace is enabled, which is the boundary —
+  put an authenticating proxy in front if other teams share the cluster.
 - **Prometheus keeps 15 days on one EBS volume.** For longer, `remote_write` to
   Amazon Managed Prometheus.
 
@@ -588,6 +605,7 @@ compactor actually enforcing retention.
 
 | Chart | Repo | Version | App version |
 |---|---|---|---|
+| `prometheus-operator-crds` | prometheus-community | 31.0.1 | — |
 | `kube-prometheus-stack` | prometheus-community | 90.0.0 | operator v0.93.1 |
 | `loki` | grafana-community | 18.12.1 | Loki 3.7.7 |
 | `alloy` | grafana | 1.12.1 | Alloy v1.19.2 |

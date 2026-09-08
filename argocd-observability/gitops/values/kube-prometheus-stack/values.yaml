@@ -1,5 +1,9 @@
 # kube-prometheus-stack 90.0.0 on Amazon EKS.
 
+# CRDs are owned by the prometheus-operator-crds Application (sync-wave -2).
+crds:
+  enabled: false
+
 ## EKS runs a managed control plane — these four components are not scrapeable.
 ## Leaving them on gives you four permanently-firing alerts on day one.
 kubeControllerManager: {enabled: false}

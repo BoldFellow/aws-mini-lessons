@@ -10,7 +10,7 @@ metadata:
     # Deleting this app also deletes the whole stack.
     - resources-finalizer.argocd.argoproj.io
 spec:
-  project: observability
+  project: bootstrap
   source:
     repoURL: https://github.com/BoldFellow/aws-mini-lessons.git
     targetRevision: main

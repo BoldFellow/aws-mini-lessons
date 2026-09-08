@@ -21,6 +21,10 @@ spec:
         releaseName: kube-prometheus-stack
         valueFiles:
           - $values/argocd-observability/gitops/values/kube-prometheus-stack/values.yaml
+          - $values/argocd-observability/gitops/values/kube-prometheus-stack/values-dev.yaml
+        # Lets the overlay be absent (or swapped for values-prod.yaml
+        # in a second Application) without failing the render.
+        ignoreMissingValueFiles: true
 
     - repoURL: https://github.com/BoldFellow/aws-mini-lessons.git
       targetRevision: main

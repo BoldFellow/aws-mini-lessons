@@ -22,6 +22,10 @@ spec:
         releaseName: loki
         valueFiles:
           - $values/argocd-observability/gitops/values/loki/values.yaml
+          - $values/argocd-observability/gitops/values/loki/values-dev.yaml
+        # Lets the overlay be absent (or swapped for values-prod.yaml
+        # in a second Application) without failing the render.
+        ignoreMissingValueFiles: true
 
     - repoURL: https://github.com/BoldFellow/aws-mini-lessons.git
       targetRevision: main

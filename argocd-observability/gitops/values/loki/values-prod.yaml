@@ -1,0 +1,71 @@
+# Production overlay for Loki.
+#
+# NOT loaded by apps/20-loki.yaml, which loads values.yaml + values-dev.yaml.
+# Point a second Application at values.yaml + this file for a prod instance.
+#
+# Everything here needs a fact this repo cannot know — your buckets, your
+# account. That is why it is not in the base file: a plausible-looking
+# placeholder that ships is worse than an absent one.
+
+loki:
+  commonConfig:
+    replication_factor: 3        # must match singleBinary.replicas below
+
+  # Append, never edit. Chunks already written are addressed by the existing
+  # filesystem entry; rewriting it makes them unreadable. Set a date in the
+  # future, then let it pass.
+  schemaConfig:
+    configs:
+      - from: "2024-04-01"
+        store: tsdb
+        object_store: filesystem
+        schema: v13
+        index: {prefix: loki_index_, period: 24h}
+      - from: "2026-10-01"        # CHANGE to a date that has not happened yet
+        store: tsdb
+        object_store: s3
+        schema: v13
+        index: {prefix: loki_index_, period: 24h}
+
+  storage:
+    type: s3
+    bucketNames:
+      chunks: CHANGEME-loki-chunks
+      ruler: CHANGEME-loki-ruler
+    s3:
+      region: eu-central-1
+      # No keys. EKS Pod Identity supplies credentials — see lesson Phase 2.
+
+  compactor:
+    retention_enabled: true
+    delete_request_store: s3
+
+# Pod Identity binds the IAM role from the AWS side, so there is no
+# eks.amazonaws.com/role-arn annotation here (that would be IRSA). The
+# association keys on namespace + this ServiceAccount name.
+serviceAccount:
+  create: true
+  name: loki
+
+singleBinary:
+  replicas: 3                    # HA; requires object storage, configured above
+  persistence:
+    storageClass: gp3
+    size: 20Gi                   # WAL + index cache only; chunks are in S3
+  resources:
+    requests: {cpu: "1", memory: 4Gi}
+    limits:   {memory: 8Gi}
+
+# Query performance at volume. Sized down from chart defaults, which assume a
+# much larger install.
+chunksCache:
+  enabled: true
+  allocatedMemory: 2048
+resultsCache:
+  enabled: true
+  allocatedMemory: 1024
+
+# Synthetic logs that prove the pipeline is alive. Noise in a lab, worth
+# alerting on in production.
+lokiCanary:
+  enabled: true

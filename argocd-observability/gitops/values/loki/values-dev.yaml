@@ -1,0 +1,12 @@
+# Dev overlay — what apps/20-loki.yaml actually loads, on top of values.yaml.
+# Keeps the POC small enough for a 2-node t3.medium cluster.
+singleBinary:
+  persistence:
+    size: 20Gi
+  resources:
+    requests: {cpu: 250m, memory: 512Mi}
+    limits:   {memory: 1Gi}
+
+loki:
+  limits_config:
+    retention_period: 168h        # 7 days is plenty while evaluating

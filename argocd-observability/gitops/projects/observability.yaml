@@ -20,8 +20,6 @@ spec:
       namespace: observability
     - server: https://kubernetes.default.svc
       namespace: kube-system      # kubelet ServiceMonitor lands here
-    - server: https://kubernetes.default.svc
-      namespace: argocd           # the root app creates Applications here
 
   # The operator needs these. Anything not listed is rejected.
   clusterResourceWhitelist:
@@ -41,3 +39,16 @@ spec:
   namespaceResourceWhitelist:
     - group: "*"
       kind: "*"
+
+  # Flags resources sitting in these namespaces that no Application claims —
+  # usually leftovers from a manual kubectl apply. Warn only, never deletes.
+  orphanedResources:
+    warn: true
+    ignore:
+      # Created by the StatefulSet controller, not tracked by Argo CD.
+      - group: ""
+        kind: PersistentVolumeClaim
+      - group: ""
+        kind: Endpoints
+      - group: discovery.k8s.io
+        kind: EndpointSlice
