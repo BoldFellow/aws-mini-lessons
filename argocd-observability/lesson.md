@@ -25,7 +25,6 @@ flowchart LR
     AL["Alloy DaemonSet<br/>wave 2"]
   end
 
-  S3[("S3<br/>chunks + ruler")]
   EBS[("EBS gp3<br/>PVCs")]
 
   ARGO["Argo CD"]
@@ -42,7 +41,6 @@ flowchart LR
   AL -->|"push logs"| LOKI
   KPS -->|"scrape /metrics"| LOKI
   KPS -->|"scrape /metrics"| AL
-  LOKI -->|"Pod Identity"| S3
   KPS --- EBS
   LOKI --- EBS
 ```
@@ -54,7 +52,7 @@ flowchart LR
 - **Sync waves** for ordering operator → Loki → log shipper
 - Why kube-prometheus-stack needs **ServerSideApply**
 - The EKS-specific settings that stop four alerts firing forever on day one
-- Loki on **S3 with EKS Pod Identity** — no access keys, no role ARNs in git
+- Loki on local disk for a POC, and the one-values-file path to S3 later
 
 ## Prerequisites
 
@@ -63,8 +61,7 @@ flowchart LR
 | EKS cluster, Kubernetes ≥ 1.25 | kube-prometheus-stack 90.x requires it |
 | Argo CD ≥ 2.6 in namespace `argocd` | multi-source needs 2.6+ |
 | EBS CSI driver add-on | for the Prometheus/Grafana/Loki PVCs |
-| `eksctl`, `kubectl`, `aws` CLI | `eksctl` ≥ 0.181 for `podidentityassociation` |
-| Linux EC2 nodes | Pod Identity is unsupported on Fargate/Windows — see Step 3 |
+| `kubectl`, and `eksctl` ≥ 0.181 for Phase 2 | |
 | A fork of this repo | you will edit values files and push |
 
 ---
@@ -114,9 +111,107 @@ kubectl patch storageclass gp2 -p \
   '{"metadata":{"annotations":{"storageclass.kubernetes.io/is-default-class":"false"}}}'
 ```
 
-## Step 3 — S3 buckets and the IAM role for Loki
+## Step 3 — Grafana admin credentials
 
-Loki keeps its chunks and index in S3. Create the buckets:
+Never commit these. Create the secret out of band:
+
+```bash
+kubectl create namespace observability --dry-run=client -o yaml | kubectl apply -f -
+
+kubectl -n observability create secret generic grafana-admin \
+  --from-literal=admin-user=admin \
+  --from-literal=admin-password="$(openssl rand -base64 24)"
+```
+
+This is the one non-reproducible step, and deliberately so: the *value* must not
+be in git. For real clusters, keep it in AWS Secrets Manager and pull it in with
+External Secrets Operator.
+
+## Step 4 — Commit and bootstrap
+
+```bash
+git add argocd-observability && git commit -m "observability stack" && git push
+
+kubectl apply -f argocd-observability/gitops/projects/observability.yaml
+kubectl apply -f argocd-observability/gitops/bootstrap/root-app.yaml
+```
+
+That is the last imperative command in this lesson. Watch it converge:
+
+```bash
+kubectl -n argocd get applications -w
+```
+
+Expected order (this is sync waves doing their job):
+
+```
+kube-prometheus-stack      Synced   Healthy    # wave 0
+loki                       Synced   Healthy    # wave 1
+alloy                      Synced   Healthy    # wave 2
+```
+
+## Step 5 — Verify
+
+```bash
+# Grafana
+kubectl -n observability port-forward svc/kube-prometheus-stack-grafana 3000:80
+# -> http://localhost:3000, user admin, password from Step 3
+
+# Are logs actually arriving?
+kubectl -n observability logs -l app.kubernetes.io/name=alloy --tail=50 | grep -i loki
+
+# Are chunks being written?
+kubectl -n observability exec sts/loki -- ls -R /var/loki/chunks | head
+```
+
+In Grafana → **Explore** → datasource **Loki**:
+
+```logql
+{namespace="observability"} |= "error"
+```
+
+And in **Explore** → datasource **Prometheus**:
+
+```promql
+sum by (namespace) (rate(container_cpu_usage_seconds_total{image!=""}[5m]))
+```
+
+## Step 6 — Prove GitOps works
+
+Change something small and push:
+
+```bash
+sed -i 's/retention: 15d/retention: 30d/' \
+  argocd-observability/gitops/values/kube-prometheus-stack/values.yaml
+git commit -am "prometheus: retain 30d" && git push
+```
+
+Within the reconcile interval (3 min by default; `argocd app sync` to force it)
+Argo CD re-renders the chart with the new values and rolls the StatefulSet.
+No `helm upgrade`, no CI job with cluster credentials.
+
+Now try the opposite — break it by hand:
+
+```bash
+kubectl -n observability scale deploy/kube-prometheus-stack-grafana --replicas=0
+```
+
+`selfHeal: true` puts it back within seconds. **The cluster cannot drift from
+git.** That is the whole point.
+
+---
+
+## Phase 2 — Moving Loki to S3
+
+Everything above runs Loki on its PVC: no buckets, no IAM, works on any cluster.
+That is the right place to start and the wrong place to stay — losing the PVC
+loses the logs, and a node drain takes ingestion with it.
+
+Moving to S3 is a values change, not a data migration, which is the reason to
+start in Monolithic mode rather than filesystem-on-SimpleScalable. Do this once
+someone other than you depends on the logs.
+
+Create the buckets:
 
 ```bash
 export AWS_REGION=eu-central-1
@@ -262,18 +357,46 @@ If you build the role by hand instead, the trust policy is:
 > to the assumed session — those tags are what make ABAC possible, and the
 > assume-role call is rejected without permission to set them.
 
-Now edit `gitops/values/loki/values.yaml` and replace the `CHANGEME` bucket
-names. There is no role ARN to fill in — that is the point:
+Finally, swap the storage block in `gitops/values/loki/values.yaml` — this is
+the entire application-side change. There is no role ARN to fill in; that is the
+point of Pod Identity:
 
 ```yaml
 loki:
+  schemaConfig:
+    configs:
+      # Do NOT edit the existing filesystem entry — chunks already written are
+      # still addressed by it. Append a new one with a future date instead.
+      - from: "2024-04-01"
+        store: tsdb
+        object_store: filesystem
+        schema: v13
+        index: {prefix: index_, period: 24h}
+      - from: "2026-10-01"          # a date that has not happened yet
+        store: tsdb
+        object_store: s3
+        schema: v13
+        index: {prefix: index_, period: 24h}
+
   storage:
+    type: s3
     bucketNames:
       chunks: <ACCOUNT_ID>-loki-chunks
       ruler:  <ACCOUNT_ID>-loki-ruler
     s3:
       region: eu-central-1
+
+  compactor:
+    delete_request_store: s3
+
+serviceAccount:
+  create: true
+  name: loki        # the Pod Identity association keys on this name
 ```
+
+Old chunks stay readable through the first schema entry; new ones go to S3. You
+can also shrink `singleBinary.persistence.size` back to ~20Gi afterwards, since
+only the WAL and index cache remain local.
 
 ### Why Pod Identity rather than IRSA
 
@@ -299,106 +422,6 @@ IAM entirely.
 > `eks.amazonaws.com/role-arn` annotation and a Pod Identity association on the
 > same ServiceAccount. The precedence is defined (Pod Identity wins) but nobody
 > debugging at 2am remembers that.
-
-## Step 4 — Grafana admin credentials
-
-Never commit these. Create the secret out of band:
-
-```bash
-kubectl create namespace observability --dry-run=client -o yaml | kubectl apply -f -
-
-kubectl -n observability create secret generic grafana-admin \
-  --from-literal=admin-user=admin \
-  --from-literal=admin-password="$(openssl rand -base64 24)"
-```
-
-This is the one non-reproducible step, and deliberately so: the *value* must not
-be in git. For real clusters, keep it in AWS Secrets Manager and pull it in with
-External Secrets Operator.
-
-## Step 5 — Commit and bootstrap
-
-```bash
-git add argocd-observability && git commit -m "observability stack" && git push
-
-kubectl apply -f argocd-observability/gitops/projects/observability.yaml
-kubectl apply -f argocd-observability/gitops/bootstrap/root-app.yaml
-```
-
-That is the last imperative command in this lesson. Watch it converge:
-
-```bash
-kubectl -n argocd get applications -w
-```
-
-Expected order (this is sync waves doing their job):
-
-```
-kube-prometheus-stack      Synced   Healthy    # wave 0
-loki                       Synced   Healthy    # wave 1
-alloy                      Synced   Healthy    # wave 2
-```
-
-## Step 6 — Verify
-
-```bash
-# Grafana
-kubectl -n observability port-forward svc/kube-prometheus-stack-grafana 3000:80
-# -> http://localhost:3000, user admin, password from Step 4
-
-# Are logs actually arriving?
-kubectl -n observability logs -l app.kubernetes.io/name=alloy --tail=50 | grep -i loki
-
-# Did anything land in S3?
-aws s3 ls "s3://${BUCKET_PREFIX}-chunks/" --recursive | head
-
-# If the bucket stays empty, check that Pod Identity actually injected
-# credentials. Both variables must be present:
-kubectl -n observability exec sts/loki -- env | grep AWS_CONTAINER_CREDENTIALS
-# -> AWS_CONTAINER_CREDENTIALS_FULL_URI=http://169.254.170.23/v1/credentials
-# -> AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE=/var/run/secrets/pods.eks.amazonaws.com/serviceaccount/eks-pod-identity-token
-#
-# Empty output means the webhook did not match: the association's namespace or
-# ServiceAccount name does not match the pod, or the agent is not running on
-# this node. Confirm with:
-kubectl -n kube-system get daemonset eks-pod-identity-agent
-aws eks list-pod-identity-associations --cluster-name "$CLUSTER" --namespace observability
-```
-
-In Grafana → **Explore** → datasource **Loki**:
-
-```logql
-{namespace="observability"} |= "error"
-```
-
-And in **Explore** → datasource **Prometheus**:
-
-```promql
-sum by (namespace) (rate(container_cpu_usage_seconds_total{image!=""}[5m]))
-```
-
-## Step 7 — Prove GitOps works
-
-Change something small and push:
-
-```bash
-sed -i 's/retention: 15d/retention: 30d/' \
-  argocd-observability/gitops/values/kube-prometheus-stack/values.yaml
-git commit -am "prometheus: retain 30d" && git push
-```
-
-Within the reconcile interval (3 min by default; `argocd app sync` to force it)
-Argo CD re-renders the chart with the new values and rolls the StatefulSet.
-No `helm upgrade`, no CI job with cluster credentials.
-
-Now try the opposite — break it by hand:
-
-```bash
-kubectl -n observability scale deploy/kube-prometheus-stack-grafana --replicas=0
-```
-
-`selfHeal: true` puts it back within seconds. **The cluster cannot drift from
-git.** That is the whole point.
 
 ---
 
@@ -444,30 +467,30 @@ strips it; the operator re-adds it. Without `ignoreDifferences` you get an
 infinite sync loop. `RespectIgnoreDifferences=true` is required for those
 exclusions to also apply under server-side apply.
 
-### Loki: Monolithic, but on S3
+### Loki: Monolithic first, S3 second
 
 | Mode | Throughput | Object storage |
 |---|---|---|
-| Monolithic (was `SingleBinary`) | up to tens of GB/day | optional, use it anyway |
+| Monolithic (was `SingleBinary`) | up to tens of GB/day | optional |
 | SimpleScalable | up to ~1 TB/day | required — *removed in Loki 4* |
 | Distributed | > 1 TB/day | required |
 
-Start Monolithic, but back it with S3 from the first day: chunks then survive
-the pod, and moving to Distributed later is a values change rather than a
-migration. Filesystem storage is for `helm template` experiments only.
+Monolithic is the only mode that runs without object storage, which is what
+makes the POC above a single values file. It is also the mode you can move to S3
+later without a migration — so start here, not on SimpleScalable.
 
 Two settings people forget:
 
 - `loki.schemaConfig` is empty by default and a real install **requires** it.
-  Use `tsdb` + `v13`. Never edit an existing schema entry — append a new one
-  with a future `from` date.
+  Use `tsdb` + `v13`. Never edit an existing schema entry — chunks already
+  written are addressed by it. Append a new one with a future `from` date.
 - `retention_period` in `limits_config` does nothing unless the compactor is
-  told to enforce it (`compactor.retention_enabled: true`). Otherwise your S3
-  bill grows forever while Grafana politely hides the old data.
+  told to enforce it (`compactor.retention_enabled: true`). Otherwise old data
+  is hidden from queries while the disk (or the bill) keeps growing.
 
 The chart's memcached caches (`chunksCache`, `resultsCache`) default to on and
-request several GB each. Correct at scale, but on a lab cluster they simply
-never schedule — hence disabled here.
+request several GB each. Correct at scale, but on a small cluster they simply
+never schedule — hence disabled.
 
 ### Alloy, not Promtail
 
@@ -528,10 +551,12 @@ the opposite of GitOps.
 ```bash
 kubectl -n argocd delete application observability-root   # cascades via finalizer
 kubectl delete namespace observability
-aws s3 rb "s3://${BUCKET_PREFIX}-chunks" --force
-aws s3 rb "s3://${BUCKET_PREFIX}-ruler"  --force
-eksctl delete podidentityassociation --cluster "$CLUSTER" --namespace observability --service-account-name loki
-aws iam delete-policy --policy-arn "arn:aws:iam::${ACCOUNT_ID}:policy/LokiS3Access"
+
+# Only if you did Phase 2:
+# aws s3 rb "s3://${BUCKET_PREFIX}-chunks" --force
+# aws s3 rb "s3://${BUCKET_PREFIX}-ruler"  --force
+# eksctl delete podidentityassociation --cluster "$CLUSTER" --namespace observability --service-account-name loki
+# aws iam delete-policy --policy-arn "arn:aws:iam::${ACCOUNT_ID}:policy/LokiS3Access"
 ```
 
 ## Reference

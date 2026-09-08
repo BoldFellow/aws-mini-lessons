@@ -1,8 +1,8 @@
-# Loki 18.12.1 (grafana-community), Monolithic mode on S3.
+# Loki 18.12.1 (grafana-community), Monolithic mode on local disk.
 #
 # Modes: Monolithic (tens of GB/day) · SimpleScalable (~1TB/day, removed in
-# Loki 4) · Distributed (>1TB/day). The latter two require object storage;
-# use it here anyway so chunks survive the pod moving.
+# Loki 4) · Distributed (>1TB/day). The latter two REQUIRE object storage;
+# Monolithic does not, which is what makes this POC simple.
 deploymentMode: Monolithic
 
 loki:
@@ -17,44 +17,36 @@ loki:
     configs:
       - from: "2024-04-01"
         store: tsdb
-        object_store: s3
+        object_store: filesystem
         schema: v13
         index: {prefix: index_, period: 24h}
 
+  # POC: chunks live on the PVC below. No buckets, no IAM, works on any cluster.
+  # Losing the PVC loses the logs, so switch to S3 before anyone depends on
+  # this — see "Moving to S3" in lesson.md. That is a values change, not a
+  # migration, which is why Monolithic mode is the right place to start.
   storage:
-    type: s3
-    bucketNames:
-      chunks: CHANGEME-loki-chunks     # see lesson.md step 3
-      ruler: CHANGEME-loki-ruler
-    s3:
-      region: eu-central-1
-      # No keys on purpose — EKS Pod Identity supplies credentials.
+    type: filesystem
 
   limits_config:
     retention_period: 744h       # 31 days
     volume_enabled: true         # Grafana's log-volume histogram
 
-  # retention_period above does NOTHING without this. Otherwise the S3 bill
-  # grows forever while Grafana quietly hides the old data.
+  # retention_period above does NOTHING without this — Grafana would hide old
+  # data while the disk kept filling until Loki stopped ingesting.
   compactor:
     retention_enabled: true
-    delete_request_store: s3
+    delete_request_store: filesystem
 
   analytics:
     reporting_enabled: false
-
-# Pod Identity binds the IAM role from the AWS side — no role-arn annotation
-# here (that would be IRSA). The association keys on namespace + this name.
-serviceAccount:
-  create: true
-  name: loki
 
 singleBinary:
   replicas: 1
   persistence:
     enabled: true
-    storageClass: gp3
-    size: 20Gi          # WAL + index cache; chunks live in S3
+    storageClass: gp3   # any RWO class; drop this line to use the cluster default
+    size: 50Gi          # holds the chunks too, until you move to S3
   resources:
     requests: {cpu: 500m, memory: 1Gi}
     limits:   {memory: 2Gi}
