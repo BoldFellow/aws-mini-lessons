@@ -78,6 +78,14 @@ values file, which Helm already loads. It does *not* pull `values.yaml` from
 your git repo. The Application syncs, reports Healthy, and applies pure
 upstream defaults. Use the `$values` form above instead.
 
+## Credentials
+
+No AWS credentials appear anywhere in this tree — no access keys, and with EKS
+Pod Identity, not even a role ARN. The namespace + ServiceAccount → IAM role
+mapping lives in the EKS control plane, so the same values files deploy into a
+different AWS account unchanged. Grafana's admin password comes from a Secret
+created out of band (or via External Secrets Operator), never from a values file.
+
 ## Value precedence
 
 `parameters` > `valuesObject` > `values` > `valueFiles` (later files win) >

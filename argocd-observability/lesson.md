@@ -43,7 +43,7 @@ flowchart LR
   AL -->|"push logs"| LOKI
   KPS -->|"scrape /metrics"| LOKI
   KPS -->|"scrape /metrics"| AL
-  LOKI -->|"IRSA"| S3
+  LOKI -->|"Pod Identity"| S3
   KPS --- EBS
   LOKI --- EBS
 ```
@@ -55,7 +55,7 @@ flowchart LR
 - **Sync waves** for ordering CRDs → operator → Loki → log shipper
 - Why kube-prometheus-stack needs **ServerSideApply** and split-out CRDs
 - The EKS-specific settings that stop four alerts firing forever on day one
-- Loki on **S3 with IRSA** — no access keys in git
+- Loki on **S3 with EKS Pod Identity** — no access keys, no role ARNs in git
 
 ## Prerequisites
 
@@ -64,7 +64,8 @@ flowchart LR
 | EKS cluster, Kubernetes ≥ 1.25 | kube-prometheus-stack 90.x requires it |
 | Argo CD ≥ 2.6 in namespace `argocd` | multi-source needs 2.6+ |
 | EBS CSI driver add-on | for the Prometheus/Grafana/Loki PVCs |
-| `eksctl`, `kubectl`, `aws` CLI | |
+| `eksctl`, `kubectl`, `aws` CLI | `eksctl` ≥ 0.181 for `podidentityassociation` |
+| Linux EC2 nodes | Pod Identity is unsupported on Fargate/Windows — see Step 3 |
 | A fork of this repo | you will edit values files and push |
 
 ---
@@ -163,24 +164,59 @@ aws iam create-policy --policy-name LokiS3Access \
   --policy-document file:///tmp/loki-s3-policy.json
 ```
 
-Bind it to the `loki` ServiceAccount with IRSA:
+Bind it to the `loki` ServiceAccount with **EKS Pod Identity**.
+
+First install the agent. It is a DaemonSet that runs on every Linux EC2 node and
+serves credentials to pods over a link-local address — without it, every AWS
+call from every pod fails with a credentials error:
 
 ```bash
-eksctl utils associate-iam-oidc-provider --cluster "$CLUSTER" --approve
-
-eksctl create iamserviceaccount \
-  --cluster "$CLUSTER" \
-  --namespace observability \
-  --name loki \
-  --role-name loki-s3 \
-  --attach-policy-arn "arn:aws:iam::${ACCOUNT_ID}:policy/LokiS3Access" \
-  --role-only --approve
+eksctl create addon --cluster "$CLUSTER" --name eks-pod-identity-agent
 ```
 
-> `--role-only` matters: the Helm chart creates the ServiceAccount, `eksctl`
-> only creates the role. If both create it, Argo CD will fight `eksctl` forever.
+Then create the association. `eksctl` will create the role with the correct
+trust policy and attach the permission policy in one step:
 
-Now edit `gitops/values/loki/values.yaml` and replace every `CHANGEME`:
+```bash
+eksctl create podidentityassociation \
+  --cluster "$CLUSTER" \
+  --namespace observability \
+  --service-account-name loki \
+  --role-name loki-s3 \
+  --permission-policy-arns "arn:aws:iam::${ACCOUNT_ID}:policy/LokiS3Access"
+```
+
+That is the whole binding. Note what is *absent*: no OIDC provider to associate,
+no ServiceAccount annotation, and therefore no account ID anywhere in the git
+repo. The mapping namespace + ServiceAccount → role lives in the EKS control
+plane, so the same values file deploys unchanged into a different AWS account.
+
+It also removes an ownership conflict that IRSA creates under GitOps: with IRSA
+you must run `eksctl create iamserviceaccount --role-only`, because otherwise
+`eksctl` and Argo CD both believe they own the `loki` ServiceAccount and fight
+over it on every sync. Pod Identity never touches Kubernetes objects at all, so
+the chart owns the ServiceAccount outright and there is nothing to reconcile.
+
+If you build the role by hand instead, the trust policy is:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": { "Service": "pods.eks.amazonaws.com" },
+    "Action": ["sts:AssumeRole", "sts:TagSession"]
+  }]
+}
+```
+
+> `sts:TagSession` is required and is the usual reason a hand-rolled role fails.
+> Pod Identity attaches session tags (cluster name, namespace, ServiceAccount)
+> to the assumed session — those tags are what make ABAC possible, and the
+> assume-role call is rejected without permission to set them.
+
+Now edit `gitops/values/loki/values.yaml` and replace the `CHANGEME` bucket
+names. There is no role ARN to fill in — that is the point:
 
 ```yaml
 loki:
@@ -190,16 +226,32 @@ loki:
       ruler:  <ACCOUNT_ID>-loki-ruler
     s3:
       region: eu-central-1
-
-serviceAccount:
-  annotations:
-    eks.amazonaws.com/role-arn: arn:aws:iam::<ACCOUNT_ID>:role/loki-s3
 ```
 
-> **EKS Pod Identity** is the newer alternative to IRSA — no OIDC provider, no
-> annotation, and the trust policy is far simpler. If you use it, delete the
-> `eks.amazonaws.com/role-arn` annotation and create a
-> `PodIdentityAssociation` for `observability/loki` instead.
+### Why Pod Identity rather than IRSA
+
+| | IRSA | Pod Identity |
+|---|---|---|
+| Cluster prerequisite | OIDC provider per cluster | `eks-pod-identity-agent` add-on |
+| Where the binding lives | annotation in your manifests | EKS control plane |
+| Role reuse across clusters | one trust policy entry per cluster | one role, many clusters |
+| Trust policy | OIDC federation with a `sub` condition string | four lines, no cluster-specific values |
+| Role chaining / session tags | no | yes (enables ABAC) |
+| Fargate, Windows nodes | works | **not supported** |
+
+The trust-policy difference is the one that bites at scale: under IRSA the
+policy embeds the cluster's OIDC issuer URL and the exact
+`system:serviceaccount:<ns>:<sa>` subject, so a role cannot be shared across
+clusters without editing it for each one. Pod Identity moves that mapping out of
+IAM entirely.
+
+> **The one case to stay on IRSA:** the agent is a DaemonSet, and Fargate does
+> not run DaemonSets, so Pod Identity does not work on Fargate or on Windows
+> nodes. Mixing is fully supported — Fargate workloads on IRSA, EC2 workloads on
+> Pod Identity, same cluster. What you must not do is put **both** an
+> `eks.amazonaws.com/role-arn` annotation and a Pod Identity association on the
+> same ServiceAccount. The precedence is defined (Pod Identity wins) but nobody
+> debugging at 2am remembers that.
 
 ## Step 4 — Grafana admin credentials
 
@@ -253,6 +305,18 @@ kubectl -n observability logs -l app.kubernetes.io/name=alloy --tail=50 | grep -
 
 # Did anything land in S3?
 aws s3 ls "s3://${BUCKET_PREFIX}-chunks/" --recursive | head
+
+# If the bucket stays empty, check that Pod Identity actually injected
+# credentials. Both variables must be present:
+kubectl -n observability exec sts/loki -- env | grep AWS_CONTAINER_CREDENTIALS
+# -> AWS_CONTAINER_CREDENTIALS_FULL_URI=http://169.254.170.23/v1/credentials
+# -> AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE=/var/run/secrets/pods.eks.amazonaws.com/serviceaccount/eks-pod-identity-token
+#
+# Empty output means the webhook did not match: the association's namespace or
+# ServiceAccount name does not match the pod, or the agent is not running on
+# this node. Confirm with:
+kubectl -n kube-system get daemonset eks-pod-identity-agent
+aws eks list-pod-identity-associations --cluster-name "$CLUSTER" --namespace observability
 ```
 
 In Grafana → **Explore** → datasource **Loki**:
@@ -397,7 +461,7 @@ kubectl -n argocd delete application observability-root   # cascades via finaliz
 kubectl delete namespace observability
 aws s3 rb "s3://${BUCKET_PREFIX}-chunks" --force
 aws s3 rb "s3://${BUCKET_PREFIX}-ruler"  --force
-eksctl delete iamserviceaccount --cluster "$CLUSTER" --namespace observability --name loki
+eksctl delete podidentityassociation --cluster "$CLUSTER" --namespace observability --service-account-name loki
 aws iam delete-policy --policy-arn "arn:aws:iam::${ACCOUNT_ID}:policy/LokiS3Access"
 ```
 
@@ -409,4 +473,5 @@ aws iam delete-policy --policy-arn "arn:aws:iam::${ACCOUNT_ID}:policy/LokiS3Acce
 - [kube-prometheus-stack chart](https://github.com/prometheus-community/helm-charts/tree/main/charts/kube-prometheus-stack)
 - [Loki deployment modes](https://grafana.com/docs/loki/latest/get-started/deployment-modes/)
 - [Migrate from Promtail to Alloy](https://grafana.com/docs/loki/latest/setup/migrate/migrate-to-alloy/)
-- [IAM roles for service accounts (IRSA)](https://docs.aws.amazon.com/eks/latest/userguide/iam-roles-for-service-accounts.html)
+- [EKS Pod Identity](https://docs.aws.amazon.com/eks/latest/userguide/pod-identities.html)
+- [IAM roles for service accounts (IRSA)](https://docs.aws.amazon.com/eks/latest/userguide/iam-roles-for-service-accounts.html) — the Fargate fallback

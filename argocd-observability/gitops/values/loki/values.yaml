@@ -36,8 +36,10 @@ loki:
       ruler: CHANGEME-loki-ruler
     s3:
       region: eu-central-1
-      # Deliberately NO accessKeyId / secretAccessKey. Credentials come from the
-      # pod's IAM role (IRSA or EKS Pod Identity) — see serviceAccount below.
+      # Deliberately NO accessKeyId / secretAccessKey. Credentials are delivered
+      # by EKS Pod Identity — see serviceAccount below. Static keys in a values
+      # file end up in git, in the rendered manifest and in a Secret, and they
+      # never rotate.
       s3ForcePathStyle: false
       insecure: false
 
@@ -62,15 +64,24 @@ loki:
     reporting_enabled: false
 
 ## ---------------------------------------------------------------------------
-## IAM: IRSA / EKS Pod Identity
+## IAM: EKS Pod Identity
 ## ---------------------------------------------------------------------------
+# Note there is NO eks.amazonaws.com/role-arn annotation here. That is IRSA.
+# Pod Identity binds the role to this ServiceAccount from the AWS side, via a
+# PodIdentityAssociation (lesson.md step 3) — the cluster manifest stays free of
+# account IDs and role ARNs, which is why the same values file works unchanged
+# across dev/staging/prod accounts.
+#
+# The association is keyed on namespace + ServiceAccount NAME, so this name is
+# load-bearing: change it here and the association must change with it.
 serviceAccount:
   create: true
   name: loki
-  annotations:
-    # IRSA. Delete this annotation if you use EKS Pod Identity instead (which
-    # needs no annotation — you create a PodIdentityAssociation instead).
-    eks.amazonaws.com/role-arn: arn:aws:iam::CHANGEME-ACCOUNT-ID:role/loki-s3
+
+# Pod Identity requires the eks-pod-identity-agent DaemonSet, which cannot run
+# on Fargate or Windows nodes. If Loki must run on Fargate, stay on IRSA for
+# this workload: add the eks.amazonaws.com/role-arn annotation above instead.
+# Never set both — Pod Identity wins, but the ambiguity costs someone an hour.
 
 ## ---------------------------------------------------------------------------
 ## Monolithic component
