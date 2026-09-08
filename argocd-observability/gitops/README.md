@@ -5,7 +5,8 @@ argocd-observability/gitops/
 ├── bootstrap/
 │   └── root-app.yaml                  # app-of-apps — the only manifest applied by hand
 ├── projects/
-│   └── observability.yaml             # AppProject — repo/namespace/kind allowlist
+│   ├── bootstrap.yaml                 # AppProject for the root app: Applications only
+│   └── observability.yaml             # AppProject for the stack: repo/namespace/kind allowlist
 ├── apps/                              # Argo CD Applications, one file per component
 │   ├── 00-prometheus-operator-crds.yaml   # sync-wave -2
 │   ├── 10-kube-prometheus-stack.yaml      # sync-wave  0
@@ -39,7 +40,10 @@ this repo means manually tracking upstream releases forever.
 
 **One AppProject per blast radius.** `default` allows any repo, any cluster, any
 namespace, any kind. The `observability` project names four repos and two
-namespaces; anything else is rejected at admission.
+namespaces; anything else is rejected at admission. The root app gets its own
+`bootstrap` project that can create nothing but `argoproj.io/Application` in the
+`argocd` namespace — so a bad commit under `apps/` cannot turn into a Deployment
+or a ClusterRole.
 
 ## The multi-source pattern, precisely
 
@@ -82,6 +86,7 @@ the chart's own `values.yaml`.
 ## Bootstrap
 
 ```bash
+kubectl apply -f projects/bootstrap.yaml
 kubectl apply -f projects/observability.yaml
 kubectl apply -f bootstrap/root-app.yaml
 ```

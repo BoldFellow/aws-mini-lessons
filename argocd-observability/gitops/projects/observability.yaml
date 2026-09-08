@@ -48,6 +48,18 @@ spec:
     - group: "*"
       kind: "*"
 
-  # Keep 10 rollback points per app.
+  # Surface resources living in the project's namespaces that no Application
+  # claims — usually leftovers from a manual kubectl apply. Warn only; Argo CD
+  # will not delete them.
   orphanedResources:
     warn: true
+    ignore:
+      # Argo CD does not track the PVCs a StatefulSet's volumeClaimTemplate
+      # creates, so every Prometheus/Loki volume would show up as orphaned.
+      - group: ""
+        kind: PersistentVolumeClaim
+      # Created by the EBS CSI driver and by kubelet, not by us.
+      - group: ""
+        kind: Endpoints
+      - group: discovery.k8s.io
+        kind: EndpointSlice

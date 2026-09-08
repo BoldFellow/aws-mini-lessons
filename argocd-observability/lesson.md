@@ -221,6 +221,7 @@ External Secrets Operator — then even the secret's existence is declarative.
 ```bash
 git add argocd-observability && git commit -m "observability stack" && git push
 
+kubectl apply -f argocd-observability/gitops/projects/bootstrap.yaml
 kubectl apply -f argocd-observability/gitops/projects/observability.yaml
 kubectl apply -f argocd-observability/gitops/bootstrap/root-app.yaml
 ```

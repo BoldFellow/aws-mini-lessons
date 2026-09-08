@@ -14,7 +14,7 @@ metadata:
     # is deleted. Remove this line if you want deleting the root to be harmless.
     - resources-finalizer.argocd.argoproj.io
 spec:
-  project: observability
+  project: bootstrap
   source:
     repoURL: https://github.com/BoldFellow/aws-mini-lessons.git
     targetRevision: main
