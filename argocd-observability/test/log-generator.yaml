@@ -1,0 +1,44 @@
+# Proves the log pipeline end to end without waiting for real traffic.
+# Apply by hand — deliberately NOT under gitops/, so Argo CD does not manage it:
+#
+#   kubectl apply -f argocd-observability/test/log-generator.yaml
+#   # then in Grafana → Explore → Loki:   {app="log-generator"} | json
+#   kubectl delete -f argocd-observability/test/log-generator.yaml
+#
+# flog writes fake Apache/JSON logs to STDOUT. Alloy already tails every pod's
+# stdout, so nothing else is needed — no sidecar, no PVC, no extra config.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: log-generator
+  namespace: observability
+  labels:
+    app: log-generator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: log-generator
+  template:
+    metadata:
+      labels:
+        app: log-generator
+    spec:
+      containers:
+        - name: flog
+          image: mingrammer/flog:0.4.4
+          args:
+            - --loop
+            - --format=json
+            - --number=10        # lines per burst
+            - --delay=1s
+          resources:
+            requests: {cpu: 10m, memory: 16Mi}
+            limits:   {memory: 32Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 10001
+            capabilities:
+              drop: ["ALL"]

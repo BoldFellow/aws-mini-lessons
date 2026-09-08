@@ -164,10 +164,25 @@ kubectl -n observability logs -l app.kubernetes.io/name=alloy --tail=50 | grep -
 kubectl -n observability exec sts/loki -- ls -R /var/loki/chunks | head
 ```
 
+Then generate some traffic so there is definitely something to find:
+
+```bash
+kubectl apply -f argocd-observability/test/log-generator.yaml
+```
+
 In Grafana → **Explore** → datasource **Loki**:
 
 ```logql
-{namespace="observability"} |= "error"
+{app="log-generator"} | json | status >= 400
+```
+
+`flog` writes fake JSON access logs to stdout; Alloy already tails every pod's
+stdout, so no sidecar or shared volume is involved. If those lines appear, the
+whole path works: kubelet wrote the file, Alloy read and parsed it, Loki stored
+it, Grafana queried it. Delete it when you are done:
+
+```bash
+kubectl delete -f argocd-observability/test/log-generator.yaml
 ```
 
 And in **Explore** → datasource **Prometheus**:
