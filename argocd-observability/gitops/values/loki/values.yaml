@@ -19,7 +19,7 @@ loki:
         store: tsdb
         object_store: filesystem
         schema: v13
-        index: {prefix: index_, period: 24h}
+        index: {prefix: loki_index_, period: 24h}
 
   # POC: chunks live on the PVC below. No buckets, no IAM, works on any cluster.
   # Losing the PVC loses the logs, so switch to S3 before anyone depends on
@@ -31,6 +31,19 @@ loki:
   limits_config:
     retention_period: 744h       # 31 days
     volume_enabled: true         # Grafana's log-volume histogram
+    # Per-log key/value pairs stored outside the label set — high-cardinality
+    # data (trace id, user id) without creating a stream per value. Needs
+    # schema v13, which is set above.
+    allow_structured_metadata: true
+
+  # Off by default. Powers automatic pattern detection in Grafana's Explore
+  # Logs — grouping "same message, different id" without writing the regex.
+  pattern_ingester:
+    enabled: true
+
+  # Lets Grafana manage Loki alert rules through its UI/API.
+  rulerConfig:
+    enable_api: true
 
   # retention_period above does NOTHING without this — Grafana would hide old
   # data while the disk kept filling until Loki stopped ingesting.

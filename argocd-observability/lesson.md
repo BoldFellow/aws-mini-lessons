@@ -484,15 +484,32 @@ exclusions to also apply under server-side apply.
 
 ### Loki: Monolithic first, S3 second
 
-| Mode | Throughput | Object storage |
-|---|---|---|
-| Monolithic (was `SingleBinary`) | up to tens of GB/day | optional |
-| SimpleScalable | up to ~1 TB/day | required — *removed in Loki 4* |
-| Distributed | > 1 TB/day | required |
+Grafana documents two modes to actually target, and one to avoid:
 
-Monolithic is the only mode that runs without object storage, which is what
-makes the POC above a single values file. It is also the mode you can move to S3
-later without a migration — so start here, not on SimpleScalable.
+| Mode | When | Object storage |
+|---|---|---|
+| **Monolithic** (was `SingleBinary`) | "a small meta monitoring stack" — and anything you're still learning | optional |
+| **Microservices** (`Distributed`) | the official recommendation for production HA; how Grafana runs it internally | required |
+| SimpleScalable | **deprecated, removed in Loki 4** — do not start here | required |
+
+Note the middle rung is going away. The old advice was Monolithic → SimpleScalable
+→ Distributed; the current advice is Monolithic for small, Microservices for
+production, and skip SSD entirely.
+
+Monolithic is also the only mode that runs without object storage, which is what
+makes the POC above a single values file — and moving it to S3 later is a values
+change, not a migration.
+
+Two settings the official monolithic example sets that the chart does not:
+`loki.pattern_ingester.enabled: true` (powers pattern detection in Grafana's
+Explore Logs) and `loki.limits_config.allow_structured_metadata: true`
+(high-cardinality fields per log line without a stream per value). Both are in
+the values file.
+
+The docs also zero out `read`/`write`/`backend` and the ten distributed
+component replica counts. That is defensive: those templates are guarded on
+`loki.deployment.isScalable` and `isDistributed`, both false in Monolithic mode,
+so they never render either way. Left out here.
 
 Two settings people forget:
 
