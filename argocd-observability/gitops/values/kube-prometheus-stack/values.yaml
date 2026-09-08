@@ -1,0 +1,173 @@
+# kube-prometheus-stack values — tuned for Amazon EKS.
+# Chart: prometheus-community/kube-prometheus-stack 90.0.0 (operator v0.93.x)
+
+# CRDs are owned by the prometheus-operator-crds Application (sync-wave -2).
+crds:
+  enabled: false
+
+## ---------------------------------------------------------------------------
+## EKS: the control plane is AWS-managed and its components are NOT scrapeable.
+## Leaving these enabled produces four permanently-firing "target down" alerts
+## on every EKS cluster. This is the single most common EKS misconfiguration.
+## ---------------------------------------------------------------------------
+kubeControllerManager:
+  enabled: false
+kubeScheduler:
+  enabled: false
+kubeEtcd:
+  enabled: false
+kubeProxy:
+  # kube-proxy on EKS binds its metrics to 127.0.0.1 by default. Enable this
+  # only after patching the kube-proxy ConfigMap: metricsBindAddress: 0.0.0.0:10249
+  enabled: false
+
+# kubelet / cAdvisor DO work on EKS and are the source of all container metrics.
+kubelet:
+  enabled: true
+  namespace: kube-system
+
+defaultRules:
+  create: true
+  rules:
+    # Disable the rule groups that reference the components turned off above.
+    etcd: false
+    kubeControllerManager: false
+    kubeSchedulerAlerting: false
+    kubeSchedulerRecording: false
+    kubeProxy: false
+
+## ---------------------------------------------------------------------------
+## Prometheus
+## ---------------------------------------------------------------------------
+prometheus:
+  prometheusSpec:
+    retention: 15d
+    retentionSize: 40GB          # keep below the PVC size so the WAL never fills the disk
+
+    # Discover ServiceMonitors/PodMonitors created by OTHER charts (Loki, Alloy,
+    # your own apps). Without these set to false, the operator only picks up
+    # objects carrying this release's helm labels.
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+    ruleSelectorNilUsesHelmValues: false
+    probeSelectorNilUsesHelmValues: false
+    scrapeConfigSelectorNilUsesHelmValues: false
+
+    # An external label is mandatory once you federate or remote-write; set it
+    # now so historical data is attributable.
+    externalLabels:
+      cluster: eks-demo
+      region: eu-central-1
+
+    resources:
+      requests:
+        cpu: 500m
+        memory: 2Gi
+      limits:
+        memory: 4Gi
+
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          # gp3 is cheaper and faster than gp2. Requires the EBS CSI driver
+          # add-on and a StorageClass named gp3 (see lesson.md step 2).
+          storageClassName: gp3
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 50Gi
+
+  # Expose via an internal NLB only if you actually need it; Argo CD port-forward
+  # is enough for the lab.
+  service:
+    type: ClusterIP
+
+## ---------------------------------------------------------------------------
+## Alertmanager
+## ---------------------------------------------------------------------------
+alertmanager:
+  enabled: true
+  alertmanagerSpec:
+    retention: 120h
+    storage:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: gp3
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 10Gi
+    resources:
+      requests:
+        cpu: 50m
+        memory: 128Mi
+      limits:
+        memory: 256Mi
+
+## ---------------------------------------------------------------------------
+## Grafana
+## ---------------------------------------------------------------------------
+grafana:
+  enabled: true
+
+  # Do NOT ship a password in git. Create the secret out-of-band, e.g.:
+  #   kubectl -n observability create secret generic grafana-admin \
+  #     --from-literal=admin-user=admin --from-literal=admin-password="$(openssl rand -base64 24)"
+  # In production, source it from AWS Secrets Manager via External Secrets Operator.
+  admin:
+    existingSecret: grafana-admin
+    userKey: admin-user
+    passwordKey: admin-password
+
+  persistence:
+    enabled: true
+    storageClassName: gp3
+    size: 10Gi
+
+  # Loki is wired in here rather than in the Loki chart, so the datasource is
+  # owned by the same release that owns Grafana.
+  additionalDataSources:
+    - name: Loki
+      type: loki
+      access: proxy
+      url: http://loki-gateway.observability.svc.cluster.local
+      jsonData:
+        timeout: 60
+        maxLines: 1000
+        # Click a log line -> jump to the matching trace/metric.
+        derivedFields: []
+
+  # Pick up dashboards from any ConfigMap labelled grafana_dashboard: "1",
+  # in any namespace. This is how you add your own dashboards via GitOps.
+  sidecar:
+    dashboards:
+      enabled: true
+      searchNamespace: ALL
+      label: grafana_dashboard
+    datasources:
+      enabled: true
+      searchNamespace: ALL
+
+  service:
+    type: ClusterIP
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 512Mi
+
+## ---------------------------------------------------------------------------
+## node-exporter / kube-state-metrics
+## ---------------------------------------------------------------------------
+prometheus-node-exporter:
+  # Fargate nodes cannot run DaemonSets; this tolerates ordinary taints only.
+  tolerations:
+    - effect: NoSchedule
+      operator: Exists
+
+kube-state-metrics:
+  metricLabelsAllowlist:
+    - pods=[*]
+    - deployments=[*]

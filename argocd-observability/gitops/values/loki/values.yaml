@@ -1,0 +1,129 @@
+# Loki values — Monolithic mode backed by S3, on Amazon EKS.
+# Chart: grafana-community/loki 18.12.1 (Loki 3.7.x)
+#
+# Deployment modes:
+#   Monolithic      — one binary, up to ~tens of GB/day. Use this to learn.
+#   SimpleScalable  — read/write/backend split, up to ~1 TB/day. (Removed in Loki 4.)
+#   Distributed     — full microservices, >1 TB/day.
+# SimpleScalable and Distributed REQUIRE object storage; Monolithic works with
+# it too and you should use S3 from day one so nothing is lost when a pod moves.
+deploymentMode: Monolithic
+
+loki:
+  # Single tenant. Set true (and send X-Scope-OrgID) for real multi-tenancy.
+  auth_enabled: false
+
+  commonConfig:
+    replication_factor: 1        # one instance in Monolithic mode
+
+  # schemaConfig is MANDATORY for any real install — the chart ships an empty
+  # one on purpose. v13 + tsdb is the only combination you should start with.
+  # Never edit an existing entry: add a NEW entry with a future `from` date.
+  schemaConfig:
+    configs:
+      - from: "2024-04-01"
+        store: tsdb
+        object_store: s3
+        schema: v13
+        index:
+          prefix: index_
+          period: 24h
+
+  storage:
+    type: s3
+    bucketNames:
+      chunks: CHANGEME-loki-chunks     # must already exist; see lesson.md step 3
+      ruler: CHANGEME-loki-ruler
+    s3:
+      region: eu-central-1
+      # Deliberately NO accessKeyId / secretAccessKey. Credentials come from the
+      # pod's IAM role (IRSA or EKS Pod Identity) — see serviceAccount below.
+      s3ForcePathStyle: false
+      insecure: false
+
+  limits_config:
+    retention_period: 744h            # 31 days; 0s = keep forever
+    volume_enabled: true              # powers Grafana's log-volume histogram
+    reject_old_samples: true
+    reject_old_samples_max_age: 168h
+    max_query_series: 5000
+    ingestion_rate_mb: 8
+    ingestion_burst_size_mb: 16
+
+  # Retention is only ENFORCED if the compactor is told to do it.
+  # Without these two lines your retention_period above is decorative and the
+  # S3 bill grows forever.
+  compactor:
+    retention_enabled: true
+    delete_request_store: s3
+
+  # Turn off the phone-home usage report.
+  analytics:
+    reporting_enabled: false
+
+## ---------------------------------------------------------------------------
+## IAM: IRSA / EKS Pod Identity
+## ---------------------------------------------------------------------------
+serviceAccount:
+  create: true
+  name: loki
+  annotations:
+    # IRSA. Delete this annotation if you use EKS Pod Identity instead (which
+    # needs no annotation — you create a PodIdentityAssociation instead).
+    eks.amazonaws.com/role-arn: arn:aws:iam::CHANGEME-ACCOUNT-ID:role/loki-s3
+
+## ---------------------------------------------------------------------------
+## Monolithic component
+## ---------------------------------------------------------------------------
+singleBinary:
+  replicas: 1
+  persistence:
+    enabled: true
+    storageClass: gp3
+    size: 20Gi          # WAL + local index cache only; chunks live in S3
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1Gi
+    limits:
+      memory: 2Gi
+
+# Zero out the scalable-mode components so the chart does not template them.
+write:
+  replicas: 0
+read:
+  replicas: 0
+backend:
+  replicas: 0
+
+# nginx in front of Loki. Keep it: it gives you one stable URL for both the
+# push path (Alloy) and the query path (Grafana).
+gateway:
+  enabled: true
+  replicas: 1
+
+## ---------------------------------------------------------------------------
+## Caches
+## ---------------------------------------------------------------------------
+# The chart's memcached caches default to ON and request several GB each. That
+# is correct for SimpleScalable at scale and wildly oversized for a lab or a
+# small Monolithic install — a very common cause of "why is nothing scheduling".
+chunksCache:
+  enabled: false
+resultsCache:
+  enabled: false
+
+## ---------------------------------------------------------------------------
+## Self-monitoring
+## ---------------------------------------------------------------------------
+monitoring:
+  serviceMonitor:
+    enabled: true       # picked up by Prometheus (selectors are open, see kps values)
+
+# The canary writes synthetic logs to prove the pipeline is alive. Useful in
+# production, noise in a lab.
+lokiCanary:
+  enabled: false
+
+test:
+  enabled: false

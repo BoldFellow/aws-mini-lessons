@@ -1,0 +1,140 @@
+# Grafana Alloy values — pod log collection into Loki.
+# Chart: grafana/alloy 1.12.1 (Alloy v1.19.x)
+
+controller:
+  type: daemonset          # one collector per node, reading that node's log files
+  tolerations:
+    - effect: NoSchedule
+      operator: Exists
+
+alloy:
+  # /var/log and /var/lib/docker/containers must be mounted for file-based
+  # collection. Without varlog: true the pipeline silently collects nothing.
+  mounts:
+    varlog: true
+    dockercontainers: true
+
+  # NODE_NAME is not set by the chart; the config below needs it to scope
+  # discovery to this node only.
+  extraEnv:
+    - name: NODE_NAME
+      valueFrom:
+        fieldRef:
+          fieldPath: spec.nodeName
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      memory: 512Mi
+
+  configMap:
+    create: true
+    content: |-
+      logging {
+        level  = "info"
+        format = "logfmt"
+      }
+
+      // ---------------------------------------------------------------------
+      // 1. Discover pods scheduled on THIS node.
+      //    Filtering server-side with a field selector keeps every collector
+      //    from listing the whole cluster — this matters a lot at scale.
+      // ---------------------------------------------------------------------
+      discovery.kubernetes "pods" {
+        role = "pod"
+
+        selectors {
+          role  = "pod"
+          field = "spec.nodeName=" + sys.env("NODE_NAME")
+        }
+      }
+
+      // ---------------------------------------------------------------------
+      // 2. Turn pod metadata into Loki labels, and build the log file path.
+      //    Keep the label set SMALL and BOUNDED. Every distinct combination of
+      //    label values is a separate stream in Loki; high-cardinality labels
+      //    (pod UID, request id, trace id) will destroy query performance.
+      //    Put those in the log line and use LogQL filters instead.
+      // ---------------------------------------------------------------------
+      discovery.relabel "pod_logs" {
+        targets = discovery.kubernetes.pods.targets
+
+        rule {
+          source_labels = ["__meta_kubernetes_namespace"]
+          target_label  = "namespace"
+        }
+
+        rule {
+          source_labels = ["__meta_kubernetes_pod_name"]
+          target_label  = "pod"
+        }
+
+        rule {
+          source_labels = ["__meta_kubernetes_pod_container_name"]
+          target_label  = "container"
+        }
+
+        rule {
+          source_labels = ["__meta_kubernetes_pod_label_app_kubernetes_io_name"]
+          target_label  = "app"
+        }
+
+        rule {
+          source_labels = ["__meta_kubernetes_node_name"]
+          target_label  = "node"
+        }
+
+        rule {
+          source_labels = ["__meta_kubernetes_namespace", "__meta_kubernetes_pod_container_name"]
+          separator     = "/"
+          target_label  = "job"
+        }
+
+        // kubelet writes to /var/log/pods/<namespace>_<pod>_<uid>/<container>/N.log
+        rule {
+          source_labels = ["__meta_kubernetes_pod_uid", "__meta_kubernetes_pod_container_name"]
+          separator     = "/"
+          action        = "replace"
+          replacement   = "/var/log/pods/*$1/*.log"
+          target_label  = "__path__"
+        }
+      }
+
+      local.file_match "pod_logs" {
+        path_targets = discovery.relabel.pod_logs.output
+      }
+
+      loki.source.file "pod_logs" {
+        targets    = local.file_match.pod_logs.targets
+        forward_to = [loki.process.pod_logs.receiver]
+      }
+
+      // ---------------------------------------------------------------------
+      // 3. Parse the containerd CRI wrapper so the timestamp and stream
+      //    (stdout/stderr) are extracted and the stored line is the app's own.
+      // ---------------------------------------------------------------------
+      loki.process "pod_logs" {
+        stage.cri {}
+
+        forward_to = [loki.write.default.receiver]
+      }
+
+      // ---------------------------------------------------------------------
+      // 4. Ship to Loki through the gateway.
+      // ---------------------------------------------------------------------
+      loki.write "default" {
+        endpoint {
+          url = "http://loki-gateway.observability.svc.cluster.local/loki/api/v1/push"
+        }
+
+        external_labels = {
+          cluster = "eks-demo",
+        }
+      }
+
+# Let Prometheus scrape Alloy itself, so you can alert on a stalled log pipeline
+# (loki_write_dropped_bytes_total, loki_source_file_* ).
+serviceMonitor:
+  enabled: true

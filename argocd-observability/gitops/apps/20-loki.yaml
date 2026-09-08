@@ -1,0 +1,64 @@
+# Loki, OSS chart.
+#
+# IMPORTANT (March 2026): the OSS Loki Helm chart moved out of grafana/helm-charts
+# to the community fork at grafana-community/helm-charts (forked at chart 6.55.0
+# and versioned independently from there — hence the 18.x version numbers).
+# The `loki` chart still published from grafana.github.io is now maintained for
+# Grafana Enterprise Logs. The old `loki-stack` chart (2.10.3) is deprecated and
+# ships an EOL Promtail — do not start new work on it.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: loki
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"   # after kube-prometheus-stack: it defines ServiceMonitor
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: observability
+
+  sources:
+    - repoURL: https://grafana-community.github.io/helm-charts
+      chart: loki
+      targetRevision: 18.12.1
+      helm:
+        releaseName: loki
+        valueFiles:
+          - $values/argocd-observability/gitops/values/loki/values.yaml
+          - $values/argocd-observability/gitops/values/loki/values-dev.yaml
+        ignoreMissingValueFiles: true
+
+    - repoURL: https://github.com/BoldFellow/aws-mini-lessons.git
+      targetRevision: main
+      ref: values
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: observability
+
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+      - PrunePropagationPolicy=foreground
+      - PruneLast=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 15s
+        factor: 2
+        maxDuration: 5m
+
+  ignoreDifferences:
+    # StatefulSet PVC templates are immutable; Argo CD reports a permanent diff
+    # if the storage class defaults get filled in by the cluster.
+    - group: apps
+      kind: StatefulSet
+      jsonPointers:
+        - /spec/volumeClaimTemplates
+
+  revisionHistoryLimit: 10
